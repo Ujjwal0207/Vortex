@@ -1,0 +1,17 @@
+[package]
+name = "vortex-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vortex-core = { path = "../vortex-core" }
+vortex-storage = { path = "../vortex-storage" }
+vortex-guard = { path = "../vortex-guard" }
+vortex-protocol = { path = "../vortex-protocol" }
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
