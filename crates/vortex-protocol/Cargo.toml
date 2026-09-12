@@ -1,0 +1,13 @@
+[package]
+name = "vortex-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vortex-core = { path = "../vortex-core" }
+bytes.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
