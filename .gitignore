@@ -1,0 +1,41 @@
+# Plans & Instructions (as requested)
+PHASES_PLAN.md
+rules.txt
+
+# Rust Build Artifacts
+target/
+**/*.rs.bk
+Cargo.lock.backup
+
+# Runtime Data & Storage
+data/
+*.vtx
+*.log
+
+# macOS System Files
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Python Virtual Environments & Bytecode (for client SDK)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# IDE & Editor Scratch Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment & Secrets
+.env
+.env.*
