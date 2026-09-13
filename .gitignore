@@ -16,6 +16,8 @@ VORTEX_RULES.md
 scripts/zero_regression.sh
 PROBLEMS_FACED.md
 PROBLEMS*.md
+USE_CASES_IN_MINI_X.md
+*USE_CASES*.md
 
 # Rust Build Artifacts
 target/
