@@ -1,0 +1,19 @@
+[package]
+name = "vortex-storage"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vortex-core = { path = "../vortex-core" }
+bytes.workspace = true
+blake3.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+memmap2.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
