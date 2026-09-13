@@ -11,20 +11,23 @@
 
 # Vortex
 
-**Self-defending, cryptographically verifiable event streaming — engineered in Rust.**
+**Self-defending, hash-chained event streaming — written in Rust.**
 
-A next-generation broker that replaces Kafka’s JVM + three-file segments with a **2.5 MB** binary, **~10 MB RAM**, unified `.vtx` storage, Blake3 lineage, and an ingress immune system that quarantines poison pills before they ever reach consumers.
+A single-node broker with a custom TCP protocol (`VTX1`), one `.vtx` file per segment, CRC32 + Blake3 record lineage, and an ingress guard that quarantines junk before it hits healthy consumers.
 
-[Quick Start](#-quick-start) · [Why Vortex](#-why-vortex) · [Architecture](#-architecture) · [CLI Playground](#-cli-playground) · [Protocol](#-vtx1-protocol) · [Benchmarks](#-benchmarks) · [Crates](#-crate-map)
+v0.1.0 is a **standalone** engine. Clustering, consumer groups, and Kafka-compatible clients are on the [roadmap](#-roadmap) — they are not in this binary yet.
 
-<br />
+[Quick Start](#-quick-start) · [Highlights](#-highlights) · [Architecture](#-architecture) · [CLI Playground](#-cli-playground) · [Protocol](#-vtx1-protocol) · [Benchmarks](#-benchmarks) · [Roadmap](#-roadmap)
+
+<br/>
 
 ![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?style=for-the-badge&logo=rust)
 ![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=for-the-badge)
 ![Binary](https://img.shields.io/badge/Broker-2.5%20MB-0ea5e9?style=for-the-badge)
-![RAM](https://img.shields.io/badge/RSS-~9.9%20MB-22c55e?style=for-the-badge)
-![p99](https://img.shields.io/badge/p99-40µs-a855f7?style=for-the-badge)
-![Integrity](https://img.shields.io/badge/Blake3-Merkle%20Chain-111827?style=for-the-badge)
+![RAM](https://img.shields.io/badge/RSS-9.9%20MB-22c55e?style=for-the-badge)
+![p50](https://img.shields.io/badge/p50-21µs-a855f7?style=for-the-badge)
+![p99](https://img.shields.io/badge/p99-40–58µs-111827?style=for-the-badge)
+![Audit](https://img.shields.io/badge/Blake3-chain%20audit-0ea5e9?style=for-the-badge)
 
 </div>
 
@@ -34,59 +37,65 @@ A next-generation broker that replaces Kafka’s JVM + three-file segments with 
 
 | I want to… | Go here |
 | :--- | :--- |
-| Run a broker in 60 seconds | [Quick Start](#-quick-start) |
-| See how it beats Kafka on size, RAM, and tail latency | [Why Vortex](#-why-vortex) |
-| Trace a produce through Guard → Engine → `.vtx` | [Architecture](#-architecture) |
+| Run a broker in a minute | [Quick Start](#-quick-start) |
+| See measured throughput, latency, RAM, binary size | [Benchmarks](#-benchmarks) |
+| Trace produce → guard → `.vtx` | [Architecture](#-architecture) |
 | Copy-paste produce / consume / bench | [CLI Playground](#-cli-playground) |
 | Decode a `VTX1` frame | [Protocol](#-vtx1-protocol) |
-| Read the full numbers | [BENCHMARKS.md](BENCHMARKS.md) |
+| Full lab notes | [BENCHMARKS.md](BENCHMARKS.md) |
 
 ---
 
-## Why Vortex
+## Highlights
 
-Kafka was designed for a different era: JVM heaps, GC pauses, and three files per segment. Vortex is a single-process Rust broker with a custom binary protocol (`VTX1`), hardware CRC32, and a Blake3 hash chain that makes every record a proof of what came before it.
+Measured on **Apple Silicon**, `rustc 1.98.1` `--release`, TCP **loopback**, **one sync produce per round-trip**.
 
-| | Apache Kafka | **Vortex** |
-| :--- | :--- | :--- |
-| Runtime | Java / JVM | **Rust — zero GC** |
-| Broker RAM | 1–4 GB | **~9.9 MB RSS under 100k msgs** |
-| Tail latency (p99) | GC spikes to tens of ms | **40–58 µs** (loopback, sync producer) |
-| Binary | ~120 MB JARs + JVM | **2.5 MB** `vortex-server` |
-| Storage | `.log` + `.index` + `.timeindex` | **One `.vtx` file** (64 KB sparse index + records) |
-| Integrity | CRC32 | **CRC32 + Blake3 Merkle chain** |
-| Poison pills | Crash consumer fleets | **Ingress Guard → `__quarantine`** |
-| Cold start | 10–30 s | **< 10 ms** |
+| | This repo (v0.1.0) |
+| :--- | :--- |
+| **Runtime** | Rust, no JVM / no GC |
+| **Broker binary** | **~2.5 MB** |
+| **CLI** | **~1.5 MB** |
+| **RSS** (100k msgs, ~100 MB data) | **9.9 MB** |
+| **Cold start** | **< 10 ms** |
+| **p50 / p99** (256–512 B messages) | **21–22 µs / 40–58 µs** |
+| **50k × 512 B ingest** | **42,342 msgs/s** · 24.55 MB/s · **1.18 s** |
+| **100k × 512 B ingest** | **43,561 msgs/s** · p99 **40 µs** |
+| **512 KiB payloads** | **871.90 MB/s** |
+| **Storage** | **One `.vtx`** (64 KB sparse index + records) |
+| **Integrity** | CRC32 + Blake3 **`prev_hash` chain** (audit in the bench) |
+| **Bad wire** | Ingress guard → `{topic}.__quarantine` |
+
+These are **Vortex numbers from this machine**, not a same-rack bake-off against Kafka.
 
 <details>
-<summary><b>Click: what “cryptographic lineage” actually means</b></summary>
+<summary><b>How the hash chain works</b></summary>
 
-<br />
+<br/>
 
-Every record stores `prev_hash` and `record_hash`. The hash is:
+Every record stores `prev_hash` and `record_hash`:
 
 ```
 Blake3(prev_hash ‖ offset ‖ timestamp ‖ key_len ‖ key ‖ val_len ‖ val)
 ```
 
-Partition 0 of topic `payments` starts from a keyed genesis hash (`VORTEX_STREAM_GENESIS_SALT_V1.00` + topic + partition). Tamper one byte in the middle of a segment and verification fails at that offset — not “sometime later when CRC happens to disagree.”
+Partition genesis is keyed (`VORTEX_STREAM_GENESIS_SALT_V1.00` + topic + partition). Produce returns the new 32-byte digest. Flip a byte in the log and decode / bench audit fails at that offset.
 
-On produce, the broker returns the new Blake3 digest so clients can audit without a full scan.
+This is a **linear chain**, not a Merkle tree. Compact membership proofs are planned later.
 
 </details>
 
 <details>
-<summary><b>Click: what the Ingress Immune System does</b></summary>
+<summary><b>Ingress guard</b></summary>
 
-<br />
+<br/>
 
-`vortex-guard` inspects every produce **before** it touches storage:
+Before storage, `vortex-guard` can reject:
 
-1. **Size cap** — default 10 MB; oversized payloads are poison pills.
-2. **Optional empty-payload reject.**
-3. **Optional UTF-8 JSON structural check** (object/array root + `serde_json` parse).
+1. Oversized messages (default **10 MB**)
+2. Empty payloads (if enabled)
+3. Non-JSON UTF-8 (if enabled)
 
-Rejected events are serialized as a `QuarantinedEvent` (topic, reason, key hex, 128-byte preview) and routed to `<topic>.__quarantine`. Healthy consumers never see the malformed wire.
+Rejects become a `QuarantinedEvent` on `{topic}.__quarantine`. Healthy consumers never see that payload.
 
 </details>
 
@@ -96,79 +105,52 @@ Rejected events are serialized as a `QuarantinedEvent` (topic, reason, key hex, 
 
 ```mermaid
 flowchart TB
-  subgraph Client["Producer / Consumer"]
-    CLI["vortex-cli<br/>produce · consume · bench"]
+  subgraph Client["Producer / consumer"]
+    CLI["vortex-cli · produce · consume · bench"]
   end
 
   subgraph Wire["TCP · VTX1"]
-    FR["Frame<br/>magic VTX1 · CRC32 payload"]
+    FR["Frame · magic VTX1 · CRC32 payload"]
   end
 
   subgraph Broker["vortex-server"]
     CONN["Connection loop"]
     ENG["Engine"]
-    GUARD["Ingress Guard"]
+    GUARD["Ingress guard"]
     Q["topic.__quarantine"]
     PART["PartitionLog"]
   end
 
-  subgraph Disk["Unified .vtx segment"]
-    HDR["0x0000–0x10000<br/>64 KB sparse index"]
-    DATA["0x10000–EOF<br/>chained records"]
+  subgraph Disk["Unified .vtx"]
+    HDR["0x0000–0x10000 · 64 KB sparse index"]
+    DATA["0x10000–EOF · chained records"]
   end
 
-  CLI --> FR
-  FR --> CONN
-  CONN --> ENG
-  ENG --> GUARD
-  GUARD -->|poison pill| Q
+  CLI --> FR --> CONN --> ENG --> GUARD
+  GUARD -->|reject| Q
   GUARD -->|ok| PART
   PART --> HDR
   PART --> DATA
 ```
 
-### Path of a produce
-
-```mermaid
-sequenceDiagram
-  participant C as vortex-cli
-  participant S as vortex-server
-  participant G as IngressValidator
-  participant L as PartitionLog / Segment
-
-  C->>S: ProduceReq (topic, partition, key, value)
-  S->>G: validate size / policy
-  alt poison pill
-    G-->>S: error
-    S->>L: write QuarantinedEvent to topic.__quarantine
-    S-->>C: ErrorResp
-  else healthy
-    L->>L: Blake3(prev ‖ offset ‖ ts ‖ key ‖ val)
-    L->>L: append to .vtx + sparse index
-    S-->>C: ProduceResp(offset, timestamp, record_hash)
-  end
-```
-
-### Dual-region `.vtx` layout
-
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  HEADER + SPARSE INDEX   64 KB  (HEADER_INDEX_REGION_SIZE)  │
+│  HEADER + SPARSE INDEX     64 KB                            │
 │  magic VTX1 · version · base_offset · genesis_hash · index  │
 ├─────────────────────────────────────────────────────────────┤
-│  RECORD REGION           mmap’d from 0x10000 → EOF          │
+│  RECORDS  mmap’d from 0x10000 → EOF                         │
 │  [len][crc32][offset][ts][prev_hash][hash][key][value] …    │
-│  Index checkpoint every 64 KB of payload  →  O(log n) seek  │
+│  index checkpoint every 64 KB  →  O(log n) seek             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Record on-disk header is **96 bytes** before key/value (`RECORD_HEADER_SIZE`).
+Record header is **96 bytes** before key/value.
 
 ---
 
 ## Quick Start
 
-**Requires** Rust 1.80+ (`rustc`).
+Rust **1.80+**.
 
 ```bash
 git clone https://github.com/Ujjwal0207/Vortex.git
@@ -180,16 +162,12 @@ Binaries land in `./target/release/`:
 
 | Binary | Typical size | Role |
 | :--- | :--- | :--- |
-| `vortex-server` | ~2.5 MB | Broker |
-| `vortex-cli` | ~1.5 MB | Admin, produce, consume, bench |
-
-### 1. Start the broker
+| `vortex-server` | **~2.5 MB** | Broker |
+| `vortex-cli` | **~1.5 MB** | Admin, produce, consume, bench |
 
 ```bash
 ./target/release/vortex-server --host 127.0.0.1 --port 9092 --data-dir ./data/vortex
 ```
-
-### 2. Create a topic, produce, consume
 
 ```bash
 BROKER=127.0.0.1:9092
@@ -203,71 +181,62 @@ $CLI --broker $BROKER produce \
   --message '{"amount": 499.00, "status": "APPROVED"}'
 
 $CLI --broker $BROKER consume --topic payments --from-offset 0 --limit 100
+
+$CLI --broker $BROKER bench --topic bench-stream --messages 50000 --size 512
 ```
 
-Produce prints **offset, timestamp, and Blake3**. Consume prints a table of offset / key / hash prefix / value.
-
-### 3. Integrity + throughput bench
-
-```bash
-./target/release/vortex-cli bench --topic bench-stream --messages 50000 --size 512
-```
+`cargo test --workspace` runs crate tests.
 
 ---
 
 ## CLI Playground
 
-Default broker is `127.0.0.1:9092`. Override with `--broker host:port`.
+Default broker: `127.0.0.1:9092`.
 
 <details open>
-<summary><code>create-topic</code> — spin up partitions</summary>
+<summary><code>create-topic</code></summary>
 
 ```bash
 vortex-cli create-topic --topic payments --partitions 1
 ```
 
-| Flag | Default | Meaning |
-| :--- | :--- | :--- |
-| `--topic` / `-t` | required | Topic name |
-| `--partitions` / `-p` | `1` | Partition count |
+| Flag | Default |
+| :--- | :--- |
+| `--topic` / `-t` | required |
+| `--partitions` / `-p` | `1` |
 
 </details>
 
 <details>
-<summary><code>produce</code> — append one event, get a hash back</summary>
+<summary><code>produce</code> — one event, hash on the wire</summary>
 
 ```bash
 vortex-cli produce --topic payments --partition 0 --key user-409 --message '{"ok":true}'
 ```
 
-| Flag | Default | Meaning |
-| :--- | :--- | :--- |
-| `--topic` / `-t` | required | Topic |
-| `--partition` / `-p` | `0` | Partition |
-| `--key` / `-k` | none | Optional key |
-| `--message` / `-m` | required | Payload bytes (UTF-8 in the CLI) |
+Prints **offset, timestamp, Blake3**. Today this is **one record per request**.
 
 </details>
 
 <details>
-<summary><code>consume</code> — fetch from an offset</summary>
+<summary><code>consume</code></summary>
 
 ```bash
 vortex-cli consume --topic payments --partition 0 --from-offset 0 --limit 100
 ```
 
-The CLI requests up to **1 MB** per fetch, then prints at most `--limit` records.
+Fetches up to **1 MB**, prints at most `--limit` rows.
 
 </details>
 
 <details>
-<summary><code>bench</code> — load + cryptographic audit</summary>
+<summary><code>bench</code> — ingest + chain audit</summary>
 
 ```bash
-vortex-cli bench --topic bench-stream --messages 10000 --size 256
+vortex-cli bench --topic bench-stream --messages 50000 --size 512
 ```
 
-Creates the topic if needed, sync-produces N payloads, then verifies the Blake3 chain on the stored records.
+Creates the topic if needed, sync-produces N payloads, then verifies the Blake3 chain.
 
 </details>
 
@@ -275,7 +244,7 @@ Creates the topic if needed, sync-produces N payloads, then verifies the Blake3 
 
 ## VTX1 Protocol
 
-Wire magic is `0x56545831` (`VTX1`), version `1`. Frames are 18-byte headers plus CRC32’d payload.
+Magic `0x56545831` (`VTX1`), version `1`. Frame = 18-byte header + CRC32’d payload.
 
 ```
 ┌────────┬─────────┬──────────┬────────┬─────────────┬────────┬──────────┐
@@ -284,30 +253,17 @@ Wire magic is `0x56545831` (`VTX1`), version `1`. Frames are 18-byte headers plu
 └────────┴─────────┴──────────┴────────┴─────────────┴────────┴──────────┘
 ```
 
-| `msg_type` | Name | Direction |
-| :---: | :--- | :--- |
-| 1 | `ProduceReq` | client → broker |
-| 2 | `ProduceResp` | offset + ts + 32-byte hash |
-| 3 | `FetchReq` | topic, partition, start offset, max bytes |
-| 4 | `FetchResp` | encoded `Record`s |
-| 5 / 6 | `CreateTopicReq` / `Resp` | partition count |
-| 7 / 8 | `MetadataReq` / `Resp` | reserved on the wire |
-| 9 | `ErrorResp` | code + message |
-
-<details>
-<summary><b>Click: ProduceResp layout</b></summary>
-
-```
-offset: u64 | timestamp: u64 | record_hash: [u8; 32]
-```
-
-</details>
+| Type | Name |
+| :---: | :--- |
+| 1 / 2 | ProduceReq / ProduceResp (`offset` + `ts` + 32-byte hash) |
+| 3 / 4 | FetchReq / FetchResp |
+| 5 / 6 | CreateTopicReq / Resp |
+| 7 / 8 | Metadata (reserved) |
+| 9 | ErrorResp |
 
 ---
 
 ## Crate map
-
-Workspace members — click a crate in the graph (GitHub) or open the path.
 
 ```mermaid
 flowchart LR
@@ -329,46 +285,70 @@ flowchart LR
   PROTO --> CORE
 ```
 
-| Crate | Path | Responsibility |
+| Crate | Path | Role |
 | :--- | :--- | :--- |
-| **vortex-core** | `crates/vortex-core` | `Record` encode/decode, Blake3 lineage, CRC32, errors |
-| **vortex-storage** | `crates/vortex-storage` | `.vtx` segments, mmap, sparse index, `PartitionLog` |
-| **vortex-guard** | `crates/vortex-guard` | Ingress validation + quarantine events |
-| **vortex-protocol** | `crates/vortex-protocol` | `VTX1` frames and request/response codecs |
-| **vortex-server** | `crates/vortex-server` | Tokio TCP broker + engine |
-| **vortex-cli** | `crates/vortex-cli` | Human CLI + bench harness |
+| **vortex-core** | `crates/vortex-core` | Record codec, Blake3 chain, CRC32 |
+| **vortex-storage** | `crates/vortex-storage` | `.vtx`, mmap, sparse index |
+| **vortex-guard** | `crates/vortex-guard` | Ingress + quarantine |
+| **vortex-protocol** | `crates/vortex-protocol` | `VTX1` frames |
+| **vortex-server** | `crates/vortex-server` | Tokio TCP broker |
+| **vortex-cli** | `crates/vortex-cli` | CLI + bench |
 
 ---
 
 ## Benchmarks
 
-Measured on **Apple Silicon**, `rustc` release, TCP loopback, **single synchronous producer**. Full tables, mega-payload run, `kill -9` recovery, and Kafka head-to-head: **[BENCHMARKS.md](BENCHMARKS.md)**.
+Same lab: Apple Silicon, loopback, **sync 1-record RTT**. Full tables live in **[BENCHMARKS.md](BENCHMARKS.md)**.
 
-| Run | Messages | Size | Throughput | p50 | p99 | Audit |
+### Headline runs
+
+| Run | Time | Throughput | Bandwidth | p50 | p99 | Audit |
 | :--- | ---: | ---: | ---: | ---: | ---: | :--- |
-| Standard | 10,000 | 256 B | 39,704 msgs/s | 22 µs | 58 µs | 100% verified in 18 ms |
-| Scale | 100,000 | 512 B | 43,561 msgs/s | 22 µs | 40 µs | 100% verified in 229 ms |
-| Mega | 100 | 512 KB | 872 MB/s | 540 µs | 1.08 ms | 100% verified |
+| **10k × 256 B** | 0.252 s | **39,704 msgs/s** | 13.33 MB/s | **22 µs** | **58 µs** | 100% in 0.018 s |
+| **50k × 512 B** | 1.18 s | **42,342 msgs/s** | 24.55 MB/s | **21 µs** | **54 µs** | 100% in 0.118 s |
+| **100k × 512 B** | 2.296 s | **43,561 msgs/s** | 25.26 MB/s | **22 µs** | **40 µs** | 100% in 0.229 s |
+| **100 × 512 KiB** | 0.057 s | 1,743 msgs/s | **871.90 MB/s** | 540 µs | 1.08 ms | 100% in 0.073 s |
 
-After 100k messages / ~100 MB data: **RSS 9.9 MB**. Hard `SIGKILL` mid-write recovered the index and served through offset `99999` with no duplicate keys.
+### Footprint & recovery
 
-> These are loopback, single-pipeline numbers — not a clustered Kafka bake-off. They show what the storage + hash path costs when the JVM is out of the way.
+| | |
+| :--- | :--- |
+| **RSS after 100k msgs** | **9.9 MB** |
+| **`vortex-server` / `vortex-cli`** | **~2.5 MB / ~1.5 MB** |
+| **`kill -9` mid-write** | Restart served through offset **`99999`**, no duplicate keys in that test |
+
+Reproduce:
+
+```bash
+./target/release/vortex-cli bench --topic bench-10k --messages 10000 --size 256
+./target/release/vortex-cli bench --topic bench-stream --messages 50000 --size 512
+./target/release/vortex-cli bench --topic huge-100k --messages 100000 --size 512
+./target/release/vortex-cli bench --topic mega-payloads --messages 100 --size 524288
+```
 
 ---
 
-## Project status
+## Roadmap
 
-Vortex is **v0.1.0** — a working single-node broker with durable `.vtx` logs, cryptographic chaining, and a poison-pill quarantine path. Clustering, consumer groups, and replication are not in this tree yet.
+Later work is ordered so we do **not** throw away the small binary, the 9.9 MB RSS path, or linger=0 latency. Clustering is planned as a **Cargo feature**, not the default server.
 
-```bash
-cargo test --workspace
-```
+| | Plan |
+| :--- | :--- |
+| **1** | Batched produce (VTX2), per-partition tasks, explicit `acks` / group commit |
+| **2** | Merkle **batch** roots + optional fetch proofs + offline verify |
+| **3** | Retention (`__lineage.manifest`) and compaction as a **new generation** (no in-place rewrite) |
+| **4** | CLI linger/batch + cooperative groups on **one node** |
+| **5** | One metadata Raft + pipelined replica acks on matching `merkle_root` |
+| **6** | Pure asyncio `vortex-py`; later a Kafka protocol **subset** |
+| **7** | Compression, TLS, metrics |
+
+Until those land, this is a **single-node, hash-chained log** with the benches above.
 
 ---
 
 <div align="center">
 
-**Apache-2.0** · Built in Rust · Hash-chained by default
+**Apache-2.0** · built in Rust · chain-audited in `vortex-cli bench`
 
 `cargo build --release && ./target/release/vortex-server`
 
