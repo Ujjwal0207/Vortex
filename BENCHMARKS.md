@@ -1,20 +1,33 @@
 # 🌀 Vortex: Official Performance Benchmarks & Verification Report
 
-This document records the official performance benchmarks, tail latency percentiles, memory footprint measurements, and cryptographic lineage audit times for the **Vortex Streaming Broker**.
+This document records performance, tail latency, memory, and hash-chain audit times for the **Vortex** broker as run on the author's machine.
+
+**How to read this:** ingest numbers are **one produce per TCP round-trip** on loopback — not a batched client. Integrity is CRC32 plus a **linear** Blake3 `prev_hash` chain (not a Merkle tree).
 
 ---
 
 ## 💻 Test Environment
 
 * **Platform:** Apple Silicon (macOS Darwin arm64)
-* **Compiler:** `rustc 1.98.1` (`--release` profile, optimized)
+* **Compiler:** `rustc 1.98.1` (`--release` profile)
 * **Transport:** TCP loopback (`127.0.0.1:9092`)
-* **Concurrency:** Single synchronous producer pipeline
-* **Integrity Engine:** Hardware CRC32 + Blake3 SIMD Cryptographic Merkle Chaining
+* **Concurrency:** Single synchronous producer
+* **Integrity:** CRC32 + Blake3 record chain (`prev_hash` / `record_hash`)
 
 ---
 
-## 📊 Benchmark Run 1: 10,000 Messages (Standard Load)
+## 📦 Build artifacts (this tree, `--release`)
+
+| Artifact | Size (as measured) |
+| :--- | :--- |
+| `vortex-server` | **~2.5 MB** |
+| `vortex-cli` | **~1.5 MB** |
+| Cold start (listen) | **< 10 ms** |
+| RSS after 100k msgs / ~100 MB data | **9.9 MB** (`ps`) |
+
+---
+
+## 📊 Run 1 — 10,000 messages (256 B)
 
 ```bash
 ./target/release/vortex-cli bench --topic bench-10k --messages 10000 --size 256
@@ -22,18 +35,36 @@ This document records the official performance benchmarks, tail latency percenti
 
 | Metric | Result |
 | :--- | :--- |
-| **Total Ingestion Time** | **0.252 seconds** |
-| **Throughput** | **39,704.15 msgs/sec** |
-| **Bandwidth** | **13.33 MB/sec** |
-| **Median Latency (p50)** | **22 µs (0.022 ms)** |
-| **95th Percentile (p95)** | **40 µs (0.040 ms)** |
-| **99th Tail Latency (p99)** | **58 µs (0.058 ms)** |
-| **Cryptographic Audit Status** | **✅ 100% of 10,000 records verified** |
-| **Audit Verification Time** | **0.018 seconds** (555,000 records/sec) |
+| **Total ingestion time** | **0.252 s** |
+| **Throughput** | **39,704.15 msgs/s** |
+| **Bandwidth** | **13.33 MB/s** |
+| **p50** | **22 µs (0.022 ms)** |
+| **p95** | **40 µs (0.040 ms)** |
+| **p99** | **58 µs (0.058 ms)** |
+| **Chain audit** | **✅ 100% of 10,000 records** |
+| **Audit time** | **0.018 s** (~555,000 records/s) |
 
 ---
 
-## 🚀 Benchmark Run 2: 100,000 Messages (Massive Volume Scale)
+## 🚀 Run 2 — 50,000 messages (512 B)
+
+```bash
+./target/release/vortex-cli bench --topic bench-stream --messages 50000 --size 512
+```
+
+| Metric | Result |
+| :--- | :--- |
+| **Total ingestion time** | **1.18 s** |
+| **Throughput** | **42,342 msgs/s** |
+| **Bandwidth** | **24.55 MB/s** |
+| **p50** | **21 µs (0.021 ms)** |
+| **p99** | **54 µs (0.054 ms)** |
+| **Chain audit** | **✅ 100% of 50,000 records** |
+| **Audit time** | **0.118 s** |
+
+---
+
+## 📈 Run 3 — 100,000 messages (512 B)
 
 ```bash
 ./target/release/vortex-cli bench --topic huge-100k --messages 100000 --size 512
@@ -41,18 +72,18 @@ This document records the official performance benchmarks, tail latency percenti
 
 | Metric | Result |
 | :--- | :--- |
-| **Total Ingestion Time** | **2.296 seconds** |
-| **Throughput** | **43,560.99 msgs/sec** |
-| **Bandwidth** | **25.26 MB/sec** |
-| **Median Latency (p50)** | **22 µs (0.022 ms)** |
-| **95th Percentile (p95)** | **28 µs (0.028 ms)** |
-| **99th Tail Latency (p99)** | **40 µs (0.040 ms)** |
-| **Cryptographic Audit Status** | **✅ 100% of 100,000 records verified** |
-| **Audit Verification Time** | **0.229 seconds** (436,680 records/sec) |
+| **Total ingestion time** | **2.296 s** |
+| **Throughput** | **43,560.99 msgs/s** |
+| **Bandwidth** | **25.26 MB/s** |
+| **p50** | **22 µs (0.022 ms)** |
+| **p95** | **28 µs (0.028 ms)** |
+| **p99** | **40 µs (0.040 ms)** |
+| **Chain audit** | **✅ 100% of 100,000 records** |
+| **Audit time** | **0.229 s** (~436,680 records/s) |
 
 ---
 
-## ⚡ Benchmark Run 3: Mega-Payload Burst (512 KB per Message)
+## ⚡ Run 4 — Mega-payload (100 × 512 KiB)
 
 ```bash
 ./target/release/vortex-cli bench --topic mega-payloads --messages 100 --size 524288
@@ -60,39 +91,42 @@ This document records the official performance benchmarks, tail latency percenti
 
 | Metric | Result |
 | :--- | :--- |
-| **Total Ingestion Time** | **0.057 seconds** (52 MB in 57 ms) |
-| **Throughput** | **1,743.48 msgs/sec** |
-| **Bandwidth** | **871.90 MB/sec** |
-| **Median Latency (p50)** | **540 µs (0.540 ms)** |
-| **99th Tail Latency (p99)** | **1,075 µs (1.075 ms)** |
-| **Cryptographic Audit Status** | **✅ 100% of 100 mega-records verified** |
-| **Audit Verification Time** | **0.073 seconds** |
+| **Total ingestion time** | **0.057 s** (52 MB in 57 ms) |
+| **Throughput** | **1,743.48 msgs/s** |
+| **Bandwidth** | **871.90 MB/s** |
+| **p50** | **540 µs (0.540 ms)** |
+| **p99** | **1,075 µs (1.075 ms)** |
+| **Chain audit** | **✅ 100% of 100 records** |
+| **Audit time** | **0.073 s** |
 
 ---
 
-## 🛡️ Chaos & Stress Verification Results
+## 🛡️ Chaos & stress
 
-### 1. Memory Stability Under 100,000+ Message Stress
-* **Resident Set Size (RSS):** **9.9 MB RAM** (measured via `ps aux` after 100,000 messages and 100MB of data).
-* **Kafka Comparison:** Apache Kafka idling JVM uses ~1.2 GB; under 100k messages it spikes to 2–3 GB with GC churn. Vortex maintained **under 10 MB total memory**.
+### Memory (100k messages)
 
-### 2. Hard Crash Recovery (`kill -9`)
-* **Scenario:** Terminated broker process violently with `SIGKILL` (`kill -9`) during active writes.
-* **Recovery:** Restarted broker on same storage directory. It scanned segment boundaries, recovered clean indexes, and resumed serving reads up to offset `99999` with **zero data corruption and zero duplicate keys**.
+* **RSS: 9.9 MB** after 100,000 messages and ~100 MB of data (`ps aux`).
+
+### Hard crash (`kill -9`)
+
+* Broker killed with `SIGKILL` during writes.
+* Restart on the same data directory recovered indexes and served reads through offset **`99999`**, with **no corrupt records and no duplicate keys** in that test.
 
 ---
 
-## 🥊 Head-to-Head Comparison: Vortex vs. Apache Kafka
+## Footprint snapshot (Vortex, this machine)
 
-| Dimension | Apache Kafka | Vortex | Winner |
-| :--- | :--- | :--- | :--- |
-| **Binary Size** | ~120 MB (JARs, scripts, JVM) | **2.5 MB** | 🏆 **Vortex (48x smaller)** |
-| **CLI Tool Size** | ~80 MB | **1.5 MB** | 🏆 **Vortex (53x smaller)** |
-| **Resident Memory (Max Load)** | 2,048 MB – 4,096 MB | **~9.9 MB** | 🏆 **Vortex (200x lighter)** |
-| **Cold Startup Time** | 10 – 30 seconds | **< 10 milliseconds** | 🏆 **Vortex (Instant boot)** |
-| **p50 Latency** | ~2,000 µs (2 ms) | **22 µs (0.022 ms)** | 🏆 **Vortex (90x faster)** |
-| **p99 Tail Latency** | Unpredictable (GC spikes up to 50ms) | **40 µs (0.040 ms)** | 🏆 **Vortex (Deterministic)** |
-| **Peak Bandwidth** | ~200 – 400 MB/sec | **871.90 MB/sec** | 🏆 **Vortex (Line-rate)** |
-| **Open File Descriptors** | 3 files per segment (`.log`, `.index`, `.timeindex`) | **1 file (`.vtx`)** | 🏆 **Vortex (3x fewer FDs)** |
-| **Poison-Pill Defense** | None (crashes consumer fleets) | **Automated Ingress Quarantine (`__quarantine`)** | 🏆 **Vortex (Zero consumer crash)** |
-| **Tamper Resistance** | CRC32 only (no proof of immutability) | **Blake3 SIMD Cryptographic Merkle Chain** | 🏆 **Vortex (Mathematically verifiable)** |
+Same numbers that used to sit in the comparison table — kept here as **Vortex measurements**, not a bake-off.
+
+| What we measured | Vortex (this repo, loopback unless noted) |
+| :--- | :--- |
+| Broker binary | **~2.5 MB** |
+| CLI binary | **~1.5 MB** |
+| RSS at 100k msgs | **~9.9 MB** |
+| Cold start | **< 10 ms** |
+| p50 (sync produce, 256–512 B) | **21–22 µs** |
+| p99 (sync produce, 256–512 B) | **40–58 µs** |
+| Peak ingest bandwidth (512 KiB payloads) | **871.90 MB/s** |
+| Files per segment | **1 × `.vtx`** |
+| Ingress rejects | routed to `{topic}.__quarantine` |
+| Record integrity | CRC32 + Blake3 `prev_hash` chain |
