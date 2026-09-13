@@ -1,8 +1,21 @@
 # Plans & Instructions (as requested)
 PHASES_PLAN.md
+PHASES*.md
+PHASE_*.md
+PHASE_3.md
+PHASE_4.md
+PHASE*.md
 IMPLEMENTATION_PLAN.md
 implementation_plan.md
+*PLAN*.md
+*plan*.md
 rules.txt
+VORTEX_RULES.md
+*RULES*.md
+*rules*.md
+scripts/zero_regression.sh
+PROBLEMS_FACED.md
+PROBLEMS*.md
 
 # Rust Build Artifacts
 target/
