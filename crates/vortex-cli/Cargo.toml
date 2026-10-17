@@ -8,7 +8,10 @@ license.workspace = true
 [dependencies]
 vortex-core = { path = "../vortex-core" }
 vortex-protocol = { path = "../vortex-protocol" }
+vortex-storage = { path = "../vortex-storage" }
+vortex-guard = { path = "../vortex-guard" }
 tokio.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 clap.workspace = true
 tracing.workspace = true
