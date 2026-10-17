@@ -63,6 +63,22 @@ pub enum VortexError {
         topic: String,
         partition: u32,
     },
+
+    #[error("Entity '{entity_id}' has been cryptographically shredded (GDPR Right-to-be-Forgotten)")]
+    EntityShredded {
+        entity_id: String,
+    },
+
+    #[error("Security violation detected: {reason}")]
+    SecurityViolation {
+        reason: String,
+    },
+
+    #[error("Encryption failed: {0}")]
+    EncryptionError(String),
+
+    #[error("Decryption failed: {0}")]
+    DecryptionError(String),
 }
 
 pub type Result<T> = std::result::Result<T, VortexError>;
