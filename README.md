@@ -24,9 +24,9 @@ Produce and fetch over a custom TCP protocol (`VTX1`). Every record seals its pr
 ![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?style=for-the-badge&logo=rust)
 ![Status](https://img.shields.io/badge/v0.1.0-single--node-yellow?style=for-the-badge)
 ![Binary](https://img.shields.io/badge/Broker-2.5%20MB-0ea5e9?style=for-the-badge)
-![RSS](https://img.shields.io/badge/RSS-9.9%20MB-22c55e?style=for-the-badge)
-![p50](https://img.shields.io/badge/p50-21µs-a855f7?style=for-the-badge)
-![p99](https://img.shields.io/badge/p99-40–58µs-111827?style=for-the-badge)
+![RSS](https://img.shields.io/badge/RSS-6.7--6.9%20MB-22c55e?style=for-the-badge)
+![p50](https://img.shields.io/badge/p50-24µs-a855f7?style=for-the-badge)
+![p99](https://img.shields.io/badge/p99-50–66µs-111827?style=for-the-badge)
 ![Blake3](https://img.shields.io/badge/Blake3-hash%20chain-0ea5e9?style=for-the-badge)
 
 </div>
@@ -448,18 +448,18 @@ These are **Vortex-on-this-machine** figures. They are not a same-hardware bake-
 
 | Run | Command | Time | Throughput | Bandwidth | p50 | p99 | Chain audit |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | :--- |
-| 10k × 256 B | `bench --messages 10000 --size 256` | 0.252 s | **39,704 msgs/s** | 13.33 MB/s | **22 µs** | **58 µs** | 100% in 0.018 s |
-| 50k × 512 B | `bench --messages 50000 --size 512` | 1.18 s | **42,342 msgs/s** | 24.55 MB/s | **21 µs** | **54 µs** | 100% in 0.118 s |
-| 100k × 512 B | `bench --messages 100000 --size 512` | 2.296 s | **43,561 msgs/s** | 25.26 MB/s | **22 µs** | **40 µs** | 100% in 0.229 s |
-| 100 × 512 KiB | `bench --messages 100 --size 524288` | 0.057 s | 1,743 msgs/s | **871.90 MB/s** | 540 µs | 1.08 ms | 100% in 0.073 s |
+| 10k × 256 B | `bench --messages 10000 --size 256` | **0.268 s** | **37,316 msgs/s** | 12.53 MB/s | **24 µs** | **66 µs** | 100% in 0.019 s |
+| 50k × 512 B | `bench --messages 50000 --size 512` | **1.306 s** | **38,282 msgs/s** | 22.20 MB/s | **25 µs** | **50 µs** | 100% in 0.120 s |
+| 100k × 512 B | `bench --messages 100000 --size 512` | **2.568 s** | **38,944 msgs/s** | 22.58 MB/s | **24 µs** | **53 µs** | 100% in 0.245 s |
+| 100 × 512 KiB | `bench --messages 100 --size 524288` | **0.112 s** | 889 msgs/s | **444.64 MB/s** | 1,061 µs | 1.91 ms | 100% in 0.072 s |
 
 ### Footprint & crash
 
 | Measurement | Result |
 | :--- | :--- |
 | `vortex-server` / `vortex-cli` | **~2.5 MB / ~1.5 MB** |
-| RSS after 100k msgs (~100 MB data) | **9.9 MB** (`ps`) |
-| Cold listen | **&lt; 10 ms** |
+| RSS under load (60k–100k msgs) | **6.7 – 6.9 MB** (`ps`) |
+| Cold port 9092 bind | **&lt; 4 ms** |
 | `kill -9` during writes | Restart served through offset **`99999`**, no duplicate keys in that test |
 
 Reproduce:
@@ -467,7 +467,7 @@ Reproduce:
 ```bash
 ./target/release/vortex-cli bench --topic bench-10k --messages 10000 --size 256
 ./target/release/vortex-cli bench --topic bench-stream --messages 50000 --size 512
-./target/release/vortex-cli bench --topic huge-100k --messages 100000 --size 512
+./target/release/vortex-cli bench --topic bench-100k --messages 100000 --size 512
 ./target/release/vortex-cli bench --topic mega-payloads --messages 100 --size 524288
 ```
 
