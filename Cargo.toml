@@ -28,3 +28,4 @@ memmap2 = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.10"
+chacha20poly1305 = "0.10"
