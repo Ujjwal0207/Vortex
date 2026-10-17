@@ -1,33 +1,41 @@
-# 🌀 Vortex: Official Performance Benchmarks & Verification Report
+# Vortex benchmarks (release, loopback)
 
-This document records performance, tail latency, memory, and hash-chain audit times for the **Vortex** broker as run on the author's machine.
+Fresh end-to-end suite on the **release** broker (`rustc 1.98.1`, `--release`, TCP loopback `127.0.0.1:9092`).
 
-**How to read this:** ingest numbers are **one produce per TCP round-trip** on loopback — not a batched client. Integrity is CRC32 plus a **linear** Blake3 `prev_hash` chain (not a Merkle tree).
+**How to read this:** every ingest number is **one produce per TCP round-trip** (`linger = 0`). Not a batched client. Integrity is CRC32 plus a **linear** Blake3 `prev_hash` chain. After each ingest, `vortex-cli bench` re-reads records; `vortex-cli scrub` then walks the `.vtx` files on disk.
 
----
-
-## 💻 Test Environment
-
-* **Platform:** Apple Silicon (macOS Darwin arm64)
-* **Compiler:** `rustc 1.98.1` (`--release` profile)
-* **Transport:** TCP loopback (`127.0.0.1:9092`)
-* **Concurrency:** Single synchronous producer
-* **Integrity:** CRC32 + Blake3 record chain (`prev_hash` / `record_hash`)
+Data dir used for this suite: `./data/vortex_bench`.
 
 ---
 
-## 📦 Build artifacts (this tree, `--release`)
+## Environment
 
-| Artifact | Size (as measured) |
+| | |
 | :--- | :--- |
-| `vortex-server` | **~2.5 MB** |
-| `vortex-cli` | **~1.5 MB** |
-| Cold start (listen) | **< 10 ms** |
-| RSS after 100k msgs / ~100 MB data | **9.9 MB** (`ps`) |
+| Platform | Apple Silicon (macOS Darwin arm64) |
+| Compiler | `rustc 1.98.1` `--release` |
+| Transport | TCP loopback, port **9092** |
+| Producer | Single synchronous pipeline |
+| Integrity | CRC32 + Blake3 record chain |
 
 ---
 
-## 📊 Run 1 — 10,000 messages (256 B)
+## Headline ingest
+
+| Scenario | Size | Count | Time | Throughput | Bandwidth | p50 | p99 | Blake3 audit |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| Standard RTT | 256 B | 10,000 | **0.268 s** | **37,316 msgs/s** | 12.53 MB/s | **24 µs** | **66 µs** | 100% in 0.019 s |
+| Sustained load | 512 B | 50,000 | **1.306 s** | **38,282 msgs/s** | 22.20 MB/s | **25 µs** | **50 µs** | 100% in 0.120 s |
+| 100k scale | 512 B | 100,000 | **2.568 s** | **38,944 msgs/s** | 22.58 MB/s | **24 µs** | **53 µs** | 100% in 0.245 s |
+| Large payload | 512 KiB | 100 | **0.112 s** | 889 msgs/s | **444.64 MB/s** | 1,061 µs | 1,909 µs | 100% in 0.072 s |
+
+100k p95 was **32 µs**. Payload on disk for 100k × 512 B was **62,288,890 bytes** (~62.3 MB including headers).
+
+---
+
+## Run details
+
+### 1. Standard RTT — 10,000 × 256 B
 
 ```bash
 ./target/release/vortex-cli bench --topic bench-10k --messages 10000 --size 256
@@ -35,18 +43,13 @@ This document records performance, tail latency, memory, and hash-chain audit ti
 
 | Metric | Result |
 | :--- | :--- |
-| **Total ingestion time** | **0.252 s** |
-| **Throughput** | **39,704.15 msgs/s** |
-| **Bandwidth** | **13.33 MB/s** |
-| **p50** | **22 µs (0.022 ms)** |
-| **p95** | **40 µs (0.040 ms)** |
-| **p99** | **58 µs (0.058 ms)** |
-| **Chain audit** | **✅ 100% of 10,000 records** |
-| **Audit time** | **0.018 s** (~555,000 records/s) |
+| Ingest time | **0.268 s** |
+| Throughput | **37,316 msgs/s** |
+| Bandwidth | **12.53 MB/s** |
+| p50 / p99 | **24 µs / 66 µs** |
+| Chain audit | **✅ 100% of 10,000** in **0.019 s** |
 
----
-
-## 🚀 Run 2 — 50,000 messages (512 B)
+### 2. Sustained load — 50,000 × 512 B
 
 ```bash
 ./target/release/vortex-cli bench --topic bench-stream --messages 50000 --size 512
@@ -54,36 +57,39 @@ This document records performance, tail latency, memory, and hash-chain audit ti
 
 | Metric | Result |
 | :--- | :--- |
-| **Total ingestion time** | **1.18 s** |
-| **Throughput** | **42,342 msgs/s** |
-| **Bandwidth** | **24.55 MB/s** |
-| **p50** | **21 µs (0.021 ms)** |
-| **p99** | **54 µs (0.054 ms)** |
-| **Chain audit** | **✅ 100% of 50,000 records** |
-| **Audit time** | **0.118 s** |
+| Ingest time | **1.306 s** |
+| Throughput | **38,282 msgs/s** |
+| Bandwidth | **22.20 MB/s** |
+| p50 / p99 | **25 µs / 50 µs** |
+| Chain audit | **✅ 100% of 50,000** in **0.120 s** |
 
----
-
-## 📈 Run 3 — 100,000 messages (512 B)
+### 3. 100,000 × 512 B (live scale check)
 
 ```bash
-./target/release/vortex-cli bench --topic huge-100k --messages 100000 --size 512
+./target/release/vortex-cli bench --topic bench-100k --messages 100000 --size 512
 ```
 
-| Metric | Result |
-| :--- | :--- |
-| **Total ingestion time** | **2.296 s** |
-| **Throughput** | **43,560.99 msgs/s** |
-| **Bandwidth** | **25.26 MB/s** |
-| **p50** | **22 µs (0.022 ms)** |
-| **p95** | **28 µs (0.028 ms)** |
-| **p99** | **40 µs (0.040 ms)** |
-| **Chain audit** | **✅ 100% of 100,000 records** |
-| **Audit time** | **0.229 s** (~436,680 records/s) |
+```
+🚀 Ingesting 100,000 events...
+  -> Progress:  20.0% (20,000 / 100,000 events)
+  -> Progress:  40.0% (40,000 / 100,000 events)
+  -> Progress:  60.0% (60,000 / 100,000 events)
+  -> Progress:  80.0% (80,000 / 100,000 events)
+  -> Progress: 100.0% (100,000 / 100,000 events)
+📊 ---------------- BENCHMARK RESULTS ----------------
+  Total Duration       : 2.568 s
+  Throughput           : 38,944.15 msgs/sec
+  Bandwidth            : 22.58 MB/sec
+  Latency (p50)        : 24 µs (0.024 ms)
+  Latency (p95)        : 32 µs (0.032 ms)
+  Latency (p99)        : 53 µs (0.053 ms)
+✅ AUDIT PASSED: 100% of 100,000 records cryptographically verified
+   with zero bit-rot in 0.245s
+```
 
----
+Sparse index at 62.3 MB: ~970 entries (one per 64 KB). Region A holds 4,080 slots (~23% used).
 
-## ⚡ Run 4 — Mega-payload (100 × 512 KiB)
+### 4. Large payload — 100 × 512 KiB
 
 ```bash
 ./target/release/vortex-cli bench --topic mega-payloads --messages 100 --size 524288
@@ -91,42 +97,74 @@ This document records performance, tail latency, memory, and hash-chain audit ti
 
 | Metric | Result |
 | :--- | :--- |
-| **Total ingestion time** | **0.057 s** (52 MB in 57 ms) |
-| **Throughput** | **1,743.48 msgs/s** |
-| **Bandwidth** | **871.90 MB/s** |
-| **p50** | **540 µs (0.540 ms)** |
-| **p99** | **1,075 µs (1.075 ms)** |
-| **Chain audit** | **✅ 100% of 100 records** |
-| **Audit time** | **0.073 s** |
+| Ingest time | **0.112 s** |
+| Throughput | **889 msgs/s** |
+| Bandwidth | **444.64 MB/s** |
+| p50 / p99 | **1,061 µs / 1,909 µs** |
+| Chain audit | **✅ 100% of 100** in **0.072 s** |
 
 ---
 
-## 🛡️ Chaos & stress
+## Disk scrub (after ingest)
 
-### Memory (100k messages)
+```bash
+./target/release/vortex-cli scrub --data-dir ./data/vortex_bench
+```
 
-* **RSS: 9.9 MB** after 100,000 messages and ~100 MB of data (`ps aux`).
+First pass (10k + 50k + mega, **60,100** records):
 
-### Hard crash (`kill -9`)
+```
+🔍 Initializing Vortex Autonomous Scrubber on: "./data/vortex_bench"
+  ✅ Segment "00000000000000000000.vtx" | Scanned: 50,000 records (31,138,890 bytes) in 60 ms | Status: HEALTHY
+  ✅ Segment "00000000000000000000.vtx" | Scanned: 10,000 records (3,658,890 bytes) in 9 ms   | Status: HEALTHY
+  ✅ Segment "00000000000000000000.vtx" | Scanned: 100 records (52,439,590 bytes) in 25 ms    | Status: HEALTHY
+🛡️ Scrub Complete: 3 segment(s) verified, 60,100 total records. Zero bit-rot detected.
+```
 
-* Broker killed with `SIGKILL` during writes.
-* Restart on the same data directory recovered indexes and served reads through offset **`99999`**, with **no corrupt records and no duplicate keys** in that test.
+100k topic:
+
+```
+🔍 Initializing Vortex Autonomous Scrubber on: "./data/vortex_bench/bench-100k"
+  ✅ Segment "00000000000000000000.vtx" | Scanned: 100,000 records (62,288,890 bytes) in 133 ms | Status: HEALTHY
+🛡️ Scrub Complete: 1 segment(s) verified, 100,000 total records. Zero bit-rot detected.
+```
 
 ---
 
-## Footprint snapshot (Vortex, this machine)
+## Memory & process
 
-Same numbers that used to sit in the comparison table — kept here as **Vortex measurements**, not a bake-off.
-
-| What we measured | Vortex (this repo, loopback unless noted) |
+| Measurement | Result |
 | :--- | :--- |
-| Broker binary | **~2.5 MB** |
-| CLI binary | **~1.5 MB** |
-| RSS at 100k msgs | **~9.9 MB** |
-| Cold start | **< 10 ms** |
-| p50 (sync produce, 256–512 B) | **21–22 µs** |
-| p99 (sync produce, 256–512 B) | **40–58 µs** |
-| Peak ingest bandwidth (512 KiB payloads) | **871.90 MB/s** |
-| Files per segment | **1 × `.vtx`** |
-| Ingress rejects | routed to `{topic}.__quarantine` |
-| Record integrity | CRC32 + Blake3 `prev_hash` chain |
+| RSS during 10k+50k+mega (~87 MB on disk, 60,100 records) | **6,992 KB (~6.9 MB)** |
+| RSS during 100k × 512 B | **~6.7 MB** |
+| Cold bind of port 9092 | **&lt; 4 ms** |
+| Shutdown | Port 9092 released; no leaked FDs reported |
+
+Broker streams into mmap / append-only `.vtx` files; it does not keep the full log as a heap copy.
+
+---
+
+## Reproduce
+
+Broker:
+
+```bash
+./target/release/vortex-server --host 127.0.0.1 --port 9092 --data-dir ./data/vortex_bench
+```
+
+Clients (separate terminal):
+
+```bash
+CLI=./target/release/vortex-cli
+$CLI bench --topic bench-10k --messages 10000 --size 256
+$CLI bench --topic bench-stream --messages 50000 --size 512
+$CLI bench --topic bench-100k --messages 100000 --size 512
+$CLI bench --topic mega-payloads --messages 100 --size 524288
+$CLI scrub --data-dir ./data/vortex_bench
+```
+
+---
+
+## Earlier recovery note
+
+A previous lab `kill -9` during writes still recovered the same data directory through offset `99999` with no duplicate keys in that test. It was not re-run as part of this suite.
