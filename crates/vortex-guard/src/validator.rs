@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use vortex_core::{error::Result, VortexError};
 
+use crate::pii::{PiiAction, PiiScanner};
+
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 #[derive(Debug, Clone)]
@@ -8,6 +10,8 @@ pub struct ValidationConfig {
     pub max_message_size: usize,
     pub enforce_utf8_json: bool,
     pub reject_empty_payload: bool,
+    pub scan_pii: bool,
+    pub pii_quarantine: bool,
 }
 
 impl Default for ValidationConfig {
@@ -16,22 +20,28 @@ impl Default for ValidationConfig {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             enforce_utf8_json: false,
             reject_empty_payload: false,
+            scan_pii: true,
+            pii_quarantine: true,
         }
     }
 }
 
 pub struct IngressValidator {
     config: ValidationConfig,
+    pii_scanner: PiiScanner,
 }
 
 impl IngressValidator {
     pub fn new(config: ValidationConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            pii_scanner: PiiScanner::new(),
+        }
     }
 
     /// Validates an incoming message at the wire boundary before it touches storage.
-    /// Fast-path rejection for oversized messages, empty payloads (if configured),
-    /// or structural corruption (poison pills).
+    /// Fast-path rejection for oversized messages, empty payloads,
+    /// structural corruption (poison pills), or security violations (leaked credentials/PII).
     pub fn validate(&self, topic: &str, key: Option<&Bytes>, value: &Bytes) -> Result<()> {
         let total_size = key.map(|k| k.len()).unwrap_or(0) + value.len();
 
@@ -43,6 +53,16 @@ impl IngressValidator {
                     total_size, self.config.max_message_size
                 ),
             });
+        }
+
+        // 2. Security & PII Leak Scanner
+        if self.config.scan_pii {
+            match self.pii_scanner.scan(value, self.config.pii_quarantine) {
+                PiiAction::Quarantine(reason) => {
+                    return Err(VortexError::SecurityViolation { reason });
+                }
+                PiiAction::Mask(_) | PiiAction::Allow => {}
+            }
         }
 
         // 2. Empty payload check
