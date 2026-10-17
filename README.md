@@ -2,345 +2,512 @@
 
 ```
  ██╗   ██╗ ██████╗ ██████╗ ████████╗███████╗██╗  ██╗
- ██║   ██║██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝
- ██║   ██║██║   ██║██████╔╝   ██║   █████╗   ╚███╔╝ 
- ╚██╗ ██╔╝██║   ██║██╔══██╗   ██║   ██╔══╝   ██╔██╗ 
+ ██║   ██╗██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝
+ ██║   ██║██║   ██║██████╔╝   ██║   █████╗   ╚███╔╝
+ ╚██╗ ██╔╝██║   ██║██╔══██╗   ██║   ██╔══╝   ██╔██╗
   ╚████╔╝ ╚██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗
    ╚═══╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
 ```
 
 # Vortex
 
-**Self-Defending, Cryptographically Verifiable Event Streaming — Built in Native Rust.**
+**A single-node Rust event log with a Blake3 hash chain, unified `.vtx` storage, and an ingress immune system.**
 
-*Zero JVM. Zero Garbage Collection. Sub-Microsecond Cryptographic Shredding. In-Line Wire Quarantine.*
+Produce and fetch over a custom TCP protocol (`VTX1`). Every record seals its predecessor. Leaked secrets can be caught **before disk**. Extra CLI labs demo crypto-shred, blind tags, and segment scrubbing.
 
-[Quick Start](#-quick-start) · [Core Innovations](#-core-innovations) · [Interactive CLI Playground](#-interactive-cli-playground) · [Architecture & Format](#-architecture--storage-format) · [Benchmarks](#-benchmarks--rea-profiling) · [Architectural Flaws Audit](#-architectural-flaws--remediation-audit) · [Roadmap](#-roadmap)
+> **v0.1.0** — one process, one data directory. Not a Kafka cluster, not a drop-in protocol, not multi-language SDKs. The benches below are **this machine, loopback, one produce per RTT**.
+
+[Quick Start](#-quick-start) · [What ships](#-what-ships) · [Architecture](#-architecture) · [CLI playground](#-interactive-cli-playground) · [Protocol](#-vtx1-wire) · [Benchmarks](#-benchmarks) · [Crates](#-crate-map) · [Roadmap](#-roadmap)
 
 <br/>
 
-[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=for-the-badge)](LICENSE)
-[![Binary](https://img.shields.io/badge/Broker_Binary-2.5_MB-0ea5e9?style=for-the-badge)](#-benchmarks--rea-profiling)
-[![RSS Memory](https://img.shields.io/badge/RSS_Memory-9.9_MB-22c55e?style=for-the-badge)](#-benchmarks--rea-profiling)
-[![Latency p50](https://img.shields.io/badge/p50_Latency-21_µs-a855f7?style=for-the-badge)](#-benchmarks--rea-profiling)
-[![Crypto](https://img.shields.io/badge/Blake3-SIMD_Chain_Audit-0ea5e9?style=for-the-badge)](#1-proof-of-log-tamper-evident-streaming-blake3-simd)
-[![Privacy](https://img.shields.io/badge/GDPR-Sub--µs_Crypto_Shred-e11d48?style=for-the-badge)](#2-sub-microsecond-gdpr-right-to-be-forgotten-crypto-shredding)
+![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?style=for-the-badge&logo=rust)
+![Status](https://img.shields.io/badge/v0.1.0-single--node-yellow?style=for-the-badge)
+![Binary](https://img.shields.io/badge/Broker-2.5%20MB-0ea5e9?style=for-the-badge)
+![RSS](https://img.shields.io/badge/RSS-9.9%20MB-22c55e?style=for-the-badge)
+![p50](https://img.shields.io/badge/p50-21µs-a855f7?style=for-the-badge)
+![p99](https://img.shields.io/badge/p99-40–58µs-111827?style=for-the-badge)
+![Blake3](https://img.shields.io/badge/Blake3-hash%20chain-0ea5e9?style=for-the-badge)
 
 </div>
 
 ---
 
-## ⚡ Jump In
+## Jump in
 
-| Goal | Direct Link |
+| I want to… | Open |
 | :--- | :--- |
-| **Boot up a broker in 60 seconds** | [Quick Start](#-quick-start) |
-| **Test-drive interactive CLI tools** | [CLI Playground](#-interactive-cli-playground) |
-| **Understand what makes Vortex unique** | [Core Innovations](#-core-innovations) |
-| **See storage format & network frame specs** | [Architecture & Storage Format](#-architecture--storage-format) |
-| **Inspect real latency & REA binary audits** | [Benchmarks & REA Profiling](#-benchmarks--rea-profiling) |
-| **Review honest architectural flaws & audit** | [Architectural Flaws & Audit](#-architectural-flaws--remediation-audit) |
+| Boot a broker and round-trip a JSON event | [Quick Start](#-quick-start) |
+| Know broker vs CLI-only features | [What ships](#-what-ships) |
+| Click through produce → guard → `.vtx` | [Architecture](#-architecture) |
+| Run `pii-check`, `shred-demo`, `blind-tag`, `scrub`, `bench` | [CLI playground](#-interactive-cli-playground) |
+| Decode a `VTX1` frame and a record | [VTX1 wire](#-vtx1-wire) |
+| See 10k / 50k / 100k / 512 KiB numbers | [Benchmarks](#-benchmarks) |
 
 ---
 
-## 💡 Core Innovations
+## What ships
 
-Vortex is designed from the ground up to solve fundamental operational, privacy, and integrity failures inherent to traditional message brokers like Apache Kafka, Redpanda, and Apache Pulsar.
+Two layers. The **broker** is what `vortex-server` does on port 9092. The **CLI labs** are local tools in `vortex-cli` that exercise crates without always going through TCP.
 
-### 1. "Proof-of-Log" Tamper-Evident Streaming (Blake3 SIMD)
-* **The Industry Problem:** In traditional brokers, root access to storage disks enables arbitrary hex-editing of log segments. If individual record CRCs are patched, the broker serves tampered historical data with zero detection.
-* **The Vortex Solution:** Every record seals a continuous Blake3 cryptographic hash of its predecessor:
-  $$\text{record\_hash} = \text{Blake3}(\text{prev\_hash} \parallel \text{offset} \parallel \text{timestamp} \parallel \text{key} \parallel \text{value})$$
-  Modifying a single byte at offset `100` invalidates the entire cryptographic chain up to the tail. The head hash serves as a verifiable cryptographic ledger proof for regulated banking, healthcare, and compliance audits.
+| Capability | In the broker today | How to try it |
+| :--- | :--- | :--- |
+| Topics, partitions, produce, fetch-by-offset | Yes | `create-topic` / `produce` / `consume` |
+| Unified `.vtx` (64 KB index + records) | Yes | data dir after produce |
+| Blake3 **linear** chain + CRC32 | Yes (every append + `Record::decode`) | `bench` audit, `scrub` |
+| Size cap (10 MB) + PII/secret scan → `{topic}.__quarantine` | Yes (`scan_pii` default on) | produce an `AKIA…` payload, or `pii-check` |
+| Envelope encrypt + `shred_entity` (ChaCha20-Poly1305) | Library + **CLI demo** (in-memory registry, not persisted on produce) | `shred-demo` |
+| Blind search tags | Library + **CLI** (`BlindIndexer`) — broker does not index tags yet | `blind-tag` |
+| Segment bit-rot / chain walk | **CLI** `scrub` (not a background server thread) | `scrub --data-dir` |
+| Consumer groups, replication, Kafka protocol, TLS | No | [Roadmap](#-roadmap) |
 
-### 2. Sub-Microsecond GDPR "Right-to-be-Forgotten" (Crypto-Shredding)
-* **The Industry Problem:** Immutable streaming logs fundamentally conflict with GDPR Article 17. Erasing a user's data in Kafka requires either multi-gigabyte segment rewrites or waiting days for compaction passes.
-* **The Vortex Solution:** Payloads are envelope-encrypted with per-entity Data Encryption Keys (DEKs). Invoking `shred_entity(user_id)` zeroizes the 256-bit key from memory in **< 1 µs**. The historical `.vtx` segments remain 100% immutable and offset-aligned, but the encrypted payload is rendered mathematically irreversible white noise.
+Produce is **one record per TCP round-trip**. Batched linger is not in this tree.
 
-### 3. Zero-Knowledge Search & Stream Processing (`BlindIndexer`)
-* **The Industry Problem:** Strict enterprise privacy policies require client-side payload encryption, rendering stream filtering, partitioning, and joins impossible without handing decryption keys to the broker.
-* **The Vortex Solution:** Vortex computes deterministic 32-byte salted Blake3 search tags. Downstream consumers and routing engines filter and match encrypted streams **without the broker ever having access to the decryption key or viewing plaintext**.
-
-### 4. In-Line Perimeter Defense ("Immune System" Broker)
-* **The Industry Problem:** If a client accidentally produces an invalid 50 MB document, an unescaped JSON string, or an exposed AWS root key, Kafka writes it directly to disk, triggering poison-pill crash loops for downstream microservices.
-* **The Vortex Solution:** `vortex-guard` inspects payloads at wire ingress in RAM *before disk allocation*. Leaked secrets (AWS keys, OpenAI tokens, PEM private keys, Luhn-verified credit cards) and malformed payloads are quarantined to a dead-letter partition, keeping healthy consumers safe.
-
-### 5. Unified Single-File Segment Architecture (`.vtx`)
-* **The Industry Problem:** Kafka maintains separate `.log`, `.index`, and `.timeindex` files per partition segment. Clusters with 20,000 partitions manage 60,000+ open file descriptors, routinely crashing with `EMFILE` ("Too many open files") and suffering index corruption on unclean crashes.
-* **The Vortex Solution:** Vortex consolidates the 64 KB sparse index (Region A) and sequential records (Region B) into a **single `.vtx` file**. This halves file descriptor consumption and eliminates index-log drift.
-
-### 6. Autonomous Proactive Integrity Scrubber
-* **The Industry Problem:** Storage drive degradation and silent bit-rot are only detected by Kafka when a consumer eventually fetches the corrupt offset, often days or weeks later during peak business hours.
-* **The Vortex Solution:** The background `Scrubber` continuously walks segments during idle I/O cycles, validating hardware CRC32 checksums and continuous Blake3 cryptographic hash chains, raising health alerts before consumer degradation.
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-* Rust **1.80+** (`cargo`, `rustc`)
-
-```bash
-# Clone the repository
-git clone https://github.com/Ujjwal0207/Vortex.git
-cd Vortex
-
-# Build optimized release binaries
-cargo build --release
-```
-
-Release binaries are generated in `./target/release/`:
-* `vortex-server` (~2.5 MB) — High-performance event streaming broker
-* `vortex-cli` (~1.5 MB) — Administrative tool, producer, consumer, and auditor
-
-### 1. Launch the Broker
-```bash
-./target/release/vortex-server --host 127.0.0.1 --port 9092 --data-dir ./data/vortex
-```
-
-### 2. Basic Produce & Consume Flow
-```bash
-CLI=./target/release/vortex-cli
-
-# 1. Create a partitioned topic
-$CLI create-topic --topic payments --partitions 1
-
-# 2. Produce an event with cryptographic confirmation
-$CLI produce --topic payments --key user-42 --message '{"amount": 1250.00, "status": "SETTLED"}'
-
-# 3. Consume events from offset 0
-$CLI consume --topic payments --from-offset 0 --limit 10
-```
-
----
-
-## 🎮 Interactive CLI Playground
-
-Try out Vortex's unique features directly using the interactive CLI subcommands below:
-
-<details open>
-<summary><b>1. Instant GDPR Crypto-Shredding Demo (<code>shred-demo</code>)</b></summary>
+<details>
+<summary><strong>Hash chain (exact bytes hashed in <code>vortex-core</code>)</strong></summary>
 
 <br/>
 
-Demonstrates sub-microsecond envelope encryption, successful decryption with an active key, instant key zeroization, and post-shred cryptographic irreversibility:
-
-```bash
-./target/release/vortex-cli shred-demo --entity user-alice-42
+```
+record_hash = Blake3(
+    prev_hash ‖ offset_be64 ‖ timestamp_be64 ‖ key_len_be32 ‖ key ‖ val_len_be32 ‖ value
+)
 ```
 
-**Interactive Output:**
-```text
-⚡ Cryptographic Shredding Ledger Demonstration (GDPR Right-to-be-Forgotten):
-   1. Generating derived 256-bit DEK for entity 'user-alice-42'...
-   2. Encrypting payload with ChaCha20-Poly1305...
-      Ciphertext (62 bytes): 0xa33c330e7c7e3556ad87dbcf...
-   3. Verifying decryption with active key...
-      Decrypted: "Patient medical record: diagnosis=confidential" ✅
-   4. Invoking GDPR shred_entity('user-alice-42')...
-      DEK zeroized from memory and marked shredded ✅
-   5. Attempting post-shred decryption of immutable log payload...
-      Result: Entity 'user-alice-42' has been cryptographically shredded (GDPR Right-to-be-Forgotten) 🛡️
-      The append-only log remains untouched and Blake3 hash chain intact,
-      but the data payload is mathematically rendered irreversible white noise.
-```
+Genesis for a partition is keyed Blake3 over salt `VORTEX_STREAM_GENESIS_SALT_V1.00` + topic + partition id.
+
+Produce responses include the new 32-byte `record_hash`. Flip a stored byte and `Record::decode` / `scrub` / `bench` audit fail at that offset. This is a **chain**, not a Merkle inclusion proof.
 
 </details>
 
 <details>
-<summary><b>2. Wire Perimeter Defense & PII Leak Scanner (<code>pii-check</code>)</b></summary>
+<summary><strong>Ingress guard (what actually runs on produce)</strong></summary>
 
 <br/>
 
-Tests `vortex-guard`'s real-time pattern matching for exposed AWS keys, OpenAI tokens, PEM certs, and credit cards:
+`IngressValidator` (`crates/vortex-guard`) on every `ProduceReq`, **before** `PartitionLog::append`:
 
-```bash
-# Test with a leaked AWS access key
-./target/release/vortex-cli pii-check --message "Config loaded: AWS_KEY=AKIAIOSFODNN7EXAMPLE"
+1. Total key+value size vs `max_message_size` (default **10 MB**)
+2. `PiiScanner` if `scan_pii` (default **true**): AWS `AKIA…`, PEM private keys, GitHub `ghp_`/`gho_`/`ghs_`/`ghr_`, OpenAI `sk-proj-` / `sk-`, Luhn credit cards. Binary/non-UTF-8 payloads **skip** the scanner.
+3. Optional empty-payload reject (off by default)
+4. Optional JSON object/array root (off by default)
 
-# Test with a Luhn-valid credit card
-./target/release/vortex-cli pii-check --message "Payment info: card=4532015112830366"
+Rejects become a `QuarantinedEvent` on `{topic}.__quarantine` and the producer gets an error frame.
+
+</details>
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+  subgraph You
+    CLI["vortex-cli"]
+  end
+
+  subgraph TCP["127.0.0.1:9092 · VTX1"]
+    FR["18-byte frame + CRC32 payload"]
+  end
+
+  subgraph Broker["vortex-server"]
+    CONN["Tokio accept loop"]
+    ENG["Engine"]
+    G["IngressValidator + PiiScanner"]
+    Q["topic.__quarantine"]
+    P["PartitionLog · Mutex per partition"]
+  end
+
+  subgraph Disk["data/vortex/topic/partition-N/"]
+    VTX["NNNN.vtx · 64 KB header + chained records"]
+  end
+
+  CLI -->|"create / produce / fetch / bench"| FR
+  FR --> CONN --> ENG --> G
+  G -->|secret / poison| Q
+  G -->|ok| P --> VTX
+
+  CLI -.->|"offline labs"| LABS["shred-demo · blind-tag · pii-check · scrub"]
 ```
 
-**Interactive Output:**
+```mermaid
+sequenceDiagram
+  participant C as vortex-cli
+  participant S as vortex-server
+  participant G as IngressValidator
+  participant L as PartitionLog
+
+  C->>S: ProduceReq (topic, partition, key, value)
+  S->>G: size + PII scan
+  alt leaked secret / oversize
+    G-->>S: error
+    S->>L: append QuarantinedEvent to topic.__quarantine
+    S-->>C: ErrorResp
+  else ok
+    L->>L: Blake3(prev ‖ offset ‖ ts ‖ key ‖ val)
+    L->>L: append .vtx + sparse index
+    S-->>C: ProduceResp(offset, timestamp, record_hash)
+  end
+```
+
+### `.vtx` layout
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  REGION A   0x0000 – 0x10000   64 KB                         │
+│  magic VTX1 · version · base_offset · genesis_hash · index   │
+├──────────────────────────────────────────────────────────────┤
+│  REGION B   0x10000 – EOF                                    │
+│  [total_len 4][crc32 4][offset 8][ts 8]                      │
+│  [prev_hash 32][record_hash 32][key][value] …                │
+│  sparse index checkpoint ~ every 64 KB of payload            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+On-disk header before key/value is **96 bytes** (`RECORD_HEADER_SIZE`). Default segment roll is **64 MB**.
+
+---
+
+## Quick Start
+
+**Needs** Rust 1.80+ (`rustc`, `cargo`).
+
+```bash
+git clone https://github.com/Ujjwal0207/Vortex.git
+cd Vortex
+cargo build --release
+```
+
+| Binary | Typical size | Role |
+| :--- | :--- | :--- |
+| `./target/release/vortex-server` | ~2.5 MB | Broker (`--host` `--port` `--data-dir`) |
+| `./target/release/vortex-cli` | ~1.5 MB | Admin + labs |
+
+### 1. Start the broker
+
+```bash
+./target/release/vortex-server --host 127.0.0.1 --port 9092 --data-dir ./data/vortex
+```
+
+Logs listen address and data directory. Override verbosity with `RUST_LOG=debug`.
+
+### 2. Round-trip an event
+
+```bash
+CLI=./target/release/vortex-cli
+
+$CLI create-topic --topic payments --partitions 1
+
+$CLI produce --topic payments --key user-409 \
+  --message '{"amount": 499.00, "status": "APPROVED"}'
+
+$CLI consume --topic payments --from-offset 0 --limit 100
+```
+
+Produce prints **offset, timestamp, Blake3**. Consume prints offset / key / hash prefix / value.
+
+### 3. Tests
+
+```bash
+cargo test --workspace
+```
+
+---
+
+## Interactive CLI playground
+
+Default `--broker 127.0.0.1:9092`. Expand a card, paste the command, match the sample output.
+
+<details open>
+<summary><code>create-topic</code> — partitions on disk</summary>
+
+```bash
+./target/release/vortex-cli create-topic --topic payments --partitions 1
+```
+
+```text
+✅ Topic 'payments' created with 1 partition(s).
+```
+
+Creates `data/vortex/payments/partition-0/` (once you produce, a `000…0.vtx` appears).
+
+| Flag | Default |
+| :--- | :--- |
+| `-t` / `--topic` | required |
+| `-p` / `--partitions` | `1` |
+
+</details>
+
+<details>
+<summary><code>produce</code> — append + hash on the ack</summary>
+
+```bash
+./target/release/vortex-cli produce \
+  --topic payments --partition 0 --key user-409 \
+  --message '{"amount": 499.00, "status": "APPROVED"}'
+```
+
+```text
+✅ Event produced successfully! Offset: 0, Timestamp: 17…, Blake3: 0x…
+```
+
+One TCP request per message. Optional `-k` / `--key`.
+
+</details>
+
+<details>
+<summary><code>consume</code> — fetch from an offset</summary>
+
+```bash
+./target/release/vortex-cli consume --topic payments --from-offset 0 --limit 10
+```
+
+Requests up to **1 MB**, prints at most `--limit` records.
+
+</details>
+
+<details>
+<summary><code>pii-check</code> — same scanner the broker uses (no TCP required)</summary>
+
+```bash
+./target/release/vortex-cli pii-check \
+  --message "Config loaded: AWS_KEY=AKIAIOSFODNN7EXAMPLE"
+```
+
 ```text
 🛡️ Scanning payload for secrets & compliance PII...
 ❌ Status: QUARANTINED (Ingress Policy Violation).
    Reason: Detected exposed AWS Access Key ID: 'AKIAIOSF...'
 ```
 
+```bash
+./target/release/vortex-cli pii-check --message "hello world"
+```
+
+```text
+✅ Status: CLEAN. …
+```
+
+`--quarantine false` redacts instead of quarantine. On a **live broker**, producing the AWS string takes the same scanner and writes `{topic}.__quarantine`.
+
 </details>
 
 <details>
-<summary><b>3. Zero-Knowledge Blind Search Tag Computation (<code>blind-tag</code>)</b></summary>
+<summary><code>shred-demo</code> — GDPR-style DEK wipe (in-process lab)</summary>
 
-<br/>
+```bash
+./target/release/vortex-cli shred-demo --entity user-alice-42
+```
 
-Generates deterministic 32-byte salted Blake3 search tags for querying encrypted streams without exposing plaintext:
+```text
+⚡ Cryptographic Shredding Ledger Demonstration …
+   2. Encrypting payload with ChaCha20-Poly1305...
+   3. Verifying decryption with active key... ✅
+   4. Invoking GDPR shred_entity('user-alice-42')...
+   5. Attempting post-shred decryption …
+      Result: Entity '…' has been cryptographically shredded …
+```
+
+Uses `EntityKeyRegistry` in RAM with a demo master key. **Does not rewrite `.vtx` files.** After shred, ciphertext is unreadable; the log bytes stay put so the Blake3 chain still verifies.
+
+Optional `--payload '…'` to encrypt your own string.
+
+</details>
+
+<details>
+<summary><code>blind-tag</code> — salted Blake3 tag for encrypted fields</summary>
 
 ```bash
 ./target/release/vortex-cli blind-tag --value "Alice.Smith@bank.com"
 ```
 
-**Interactive Output:**
 ```text
 🔐 Zero-Knowledge Blind Search Tag:
    Input Value: "Alice.Smith@bank.com"
-   Salt Hash:   0xa5b562abe4a2cd55
-   Blind Tag:   0x4b2db617dadb63f3c17021121c31a3e0a9074243f86ec4b4f7d6f4ef75b75887
-   Broker can index & route on this tag without decrypting plaintext.
+   Salt Hash:   0x…
+   Blind Tag:   0x…64 hex chars…
 ```
+
+`--salt` defaults to `vortex-default-salt`. Values are trimmed + lowercased before hashing (`vortex-blind-index-v1:` domain). The **broker does not store or query tags yet** — this is the primitive for a later index.
 
 </details>
 
 <details>
-<summary><b>4. Autonomous Storage Segment Scrubber (<code>scrub</code>)</b></summary>
-
-<br/>
-
-Audits local `.vtx` segment files on disk, verifying CRC32 checksums and complete Blake3 hash chains:
+<summary><code>scrub</code> — walk `.vtx` files for CRC and chain breaks</summary>
 
 ```bash
 ./target/release/vortex-cli scrub --data-dir ./data/vortex
 ```
 
-**Interactive Output:**
 ```text
 🔍 Initializing Vortex Autonomous Scrubber on: "./data/vortex"
-  ✅ Segment "00000000000000000000.vtx" | Scanned: 100000 records (62288890 bytes) in 128 ms | Status: HEALTHY
-🛡️ Scrub Complete: 1 segment(s) verified, 100000 total records. Zero bit-rot detected.
+  ✅ Segment "00000000000000000000.vtx" | Scanned: N records (…) in T ms | Status: HEALTHY
+🛡️ Scrub Complete: 1 segment(s) verified, N total records. Zero bit-rot detected.
 ```
+
+Default `--data-dir` is `./data`. Point it at the **same directory as the broker** (`./data/vortex`). Recurses for `*.vtx`. This is an **on-demand CLI walk**, not a daemon inside `vortex-server`.
 
 </details>
 
 <details>
-<summary><b>5. High-Throughput & Cryptographic Audit Benchmark (<code>bench</code>)</b></summary>
-
-<br/>
-
-Executes a synchronous loopback ingestion test, measures p50/p99 latency, and conducts an end-to-end cryptographic audit:
+<summary><code>bench</code> — ingest + full chain audit</summary>
 
 ```bash
 ./target/release/vortex-cli bench --topic bench-stream --messages 50000 --size 512
 ```
 
+Creates the topic, sync-produces N payloads, then fetches and verifies every `record_hash` against `prev_hash`.
+
+| Flag | Default |
+| :--- | :--- |
+| `-t` / `--topic` | `bench-stream` |
+| `-m` / `--messages` | `10000` |
+| `-s` / `--size` | `256` |
+
 </details>
 
 ---
 
-## 📐 Architecture & Storage Format
+## VTX1 wire
+
+Magic **`0x56545831`** (`VTX1`), version **1**. Header **18 bytes**, then CRC32 of the payload.
+
+```
+┌────────┬─────────┬──────────┬────────┬─────────────┬────────┬──────────┐
+│ magic  │ version │ msg_type │ req_id │ payload_len │ crc32  │ payload  │
+│ 4B     │ 1B      │ 1B       │ 4B     │ 4B          │ 4B     │ N        │
+└────────┴─────────┴──────────┴────────┴─────────────┴────────┴──────────┘
+```
+
+| Type | Name | Who |
+| :---: | :--- | :--- |
+| 1 / 2 | ProduceReq / ProduceResp | client ↔ broker (`offset`, `timestamp`, `[u8;32]` hash) |
+| 3 / 4 | FetchReq / FetchResp | start offset + max bytes → encoded `Record`s |
+| 5 / 6 | CreateTopicReq / Resp | partition count |
+| 7 / 8 | Metadata | reserved (returns unsupported) |
+| 9 | ErrorResp | code + message |
+
+<details>
+<summary><strong>Record on disk / in FetchResp</strong></summary>
+
+```
+total_len:u32 | crc32:u32 | offset:u64 | timestamp:u64
+prev_hash:32 | record_hash:32 | key_len:i32 | key | val_len:u32 | value
+```
+
+`key_len = -1` means no key.
+
+</details>
+
+---
+
+## Crate map
 
 ```mermaid
-flowchart TB
-  subgraph Ingress["Client & Wire Ingress (Port 9092)"]
-    CLI["vortex-cli · Custom SDK"]
-    FR["VTX1 Network Frame · 18-Byte Header + CRC32"]
-  end
+flowchart LR
+  CLI[vortex-cli]
+  SRV[vortex-server]
+  CORE[vortex-core]
+  STOR[vortex-storage]
+  GUARD[vortex-guard]
+  PROTO[vortex-protocol]
 
-  subgraph Broker["vortex-server Core"]
-    TCP["Tokio TCP Connection Loop"]
-    ENG["Streaming Engine"]
-    GUARD["🛡️ vortex-guard: Wire Ingress Quarantine"]
-    DLQ["topic.__quarantine (Dead-Letter Log)"]
-    CRYPTO["⚡ Crypto Layer: ChaCha20-Poly1305 + BlindIndexer"]
-    PART["PartitionLog Router"]
-  end
-
-  subgraph Storage["Unified .vtx Segment on Disk"]
-    REGA["Region A: 0x00000–0x10000 (64 KB Sparse Index)"]
-    REGB["Region B: 0x10000–EOF (Sequential Records + Blake3 Chaining)"]
-    SCRUB["🩺 Autonomous Background Scrubber"]
-  end
-
-  CLI --> FR --> TCP --> ENG --> GUARD
-  GUARD -->|Violation / Secret Leak| DLQ
-  GUARD -->|Passed| CRYPTO --> PART
-  PART --> REGA
-  PART --> REGB
-  SCRUB -.->|Continuous Audit| REGB
+  CLI --> PROTO
+  CLI --> CORE
+  CLI --> STOR
+  CLI --> GUARD
+  SRV --> PROTO
+  SRV --> CORE
+  SRV --> STOR
+  SRV --> GUARD
+  STOR --> CORE
+  GUARD --> CORE
+  PROTO --> CORE
 ```
 
-### The Single-File `.vtx` Layout
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│ REGION A: HEADER & SPARSE INDEX (0x0000 – 0x10000 · 64 KB)             │
-│ Magic (VTX1) · Version · Base Offset · Genesis Hash · Created At       │
-│ Index Entries: [Relative Offset (4B) | Physical Position (8B) | Δt]   │
-├────────────────────────────────────────────────────────────────────────┤
-│ REGION B: APPEND-ONLY DATA REGION (0x10000 – EOF)                      │
-│ ┌──────────┬────────┬────────┬───────────┬───────────┬──────┬──────┐   │
-│ │total_len │ crc32  │ offset │ timestamp │ prev_hash │ hash │ key  │val│
-│ │   4B     │   4B   │   8B   │    8B     │    32B    │ 32B  │ 4B+K │4B+V
-│ └──────────┴────────┴────────┴───────────┴───────────┴──────┴──────┘   │
-└────────────────────────────────────────────────────────────────────────┘
-```
+| Crate | Path | Responsibility |
+| :--- | :--- | :--- |
+| **vortex-core** | `crates/vortex-core` | `Record`, Blake3 chain, `EntityKeyRegistry`, `BlindIndexer` |
+| **vortex-storage** | `crates/vortex-storage` | `.vtx` mmap, sparse index, `Scrubber` |
+| **vortex-guard** | `crates/vortex-guard` | Size/JSON policy, `PiiScanner`, quarantine events |
+| **vortex-protocol** | `crates/vortex-protocol` | VTX1 frames and codecs |
+| **vortex-server** | `crates/vortex-server` | Tokio TCP + `Engine` |
+| **vortex-cli** | `crates/vortex-cli` | Human CLI, bench, labs |
 
-* **96-Byte Base Overhead:** Constant-size record header ensuring deterministic serialization.
-* **Dual-Framing Recovery:** If power fails during write, tail verification inspects `total_len` and `crc32`, cleanly truncating invalid partial writes in microseconds.
+Workspace: Edition 2021, Tokio 1.38, Blake3 1.5, `chacha20poly1305` 0.10.
 
 ---
 
-## 📊 Benchmarks & REA Profiling
+## Benchmarks
 
-Tested on Apple Silicon, `rustc 1.98.1` (`--release`), TCP loopback, **synchronous 1-record round-trip time (linger = 0)**.
+**Lab:** Apple Silicon (macOS arm64), `rustc 1.98.1` `--release`, TCP **loopback** `127.0.0.1:9092`, **one synchronous producer** (one produce per RTT). After ingest, the CLI re-reads records and checks the Blake3 chain.
 
-### Performance Benchmarks
+These are **Vortex-on-this-machine** figures. They are not a same-hardware bake-off with Kafka.
 
-| Ingest Workload | Duration | Throughput | Bandwidth | p50 Latency | p99 Latency | Hash Chain Audit |
-| :--- | ---: | ---: | ---: | ---: | ---: | :--- |
-| **10,000 × 256 B** | 0.252 s | **39,704 msgs/s** | 13.33 MB/s | **22 µs** | **58 µs** | 100% verified (0.018 s) |
-| **50,000 × 512 B** | 1.180 s | **42,342 msgs/s** | 24.55 MB/s | **21 µs** | **54 µs** | 100% verified (0.118 s) |
-| **100,000 × 512 B**| 2.296 s | **43,561 msgs/s** | 25.26 MB/s | **22 µs** | **40 µs** | 100% verified (0.229 s) |
-| **100 × 512 KiB**  | 0.057 s | 1,743 msgs/s | **871.90 MB/s** | 540 µs | 1.08 ms | 100% verified (0.073 s) |
+### Headline table
 
-### Reverse-Engineering & Binary Profile (via REA)
+| Run | Command | Time | Throughput | Bandwidth | p50 | p99 | Chain audit |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | :--- |
+| 10k × 256 B | `bench --messages 10000 --size 256` | 0.252 s | **39,704 msgs/s** | 13.33 MB/s | **22 µs** | **58 µs** | 100% in 0.018 s |
+| 50k × 512 B | `bench --messages 50000 --size 512` | 1.18 s | **42,342 msgs/s** | 24.55 MB/s | **21 µs** | **54 µs** | 100% in 0.118 s |
+| 100k × 512 B | `bench --messages 100000 --size 512` | 2.296 s | **43,561 msgs/s** | 25.26 MB/s | **22 µs** | **40 µs** | 100% in 0.229 s |
+| 100 × 512 KiB | `bench --messages 100 --size 524288` | 0.057 s | 1,743 msgs/s | **871.90 MB/s** | 540 µs | 1.08 ms | 100% in 0.073 s |
 
-| Profile Dimension | Apache Kafka (JVM) | Redpanda (C++) | Vortex (Rust Native) |
-| :--- | :--- | :--- | :--- |
-| **Binary Footprint** | ~600 MB (with OpenJDK) | ~150 MB (C++ Seastar) | **2.65 MB** |
-| **Dynamic Dylibs** | 45+ JARs, libc, libjvm | libstdc++, libpthread, libaio | **2 Dylibs** (`libSystem.B.dylib`) |
-| **Static Memory (`__bss`)**| Hundreds of MBs | GB preallocations | **192 bytes** |
-| **RSS (100k messages)**| 1.5 – 4.0 GB | 1.0 – 2.5 GB | **9.9 MB** |
-| **SIMD Vectorization** | Software fallback | Hardware CRC-NI | **ARM64 NEON Blake3** (`_blake3_hash_many_neon`) |
-| **Cold Startup Time** | 5,000 – 15,000 ms | 1,000 – 2,000 ms | **< 4 ms** |
+### Footprint & crash
 
----
+| Measurement | Result |
+| :--- | :--- |
+| `vortex-server` / `vortex-cli` | **~2.5 MB / ~1.5 MB** |
+| RSS after 100k msgs (~100 MB data) | **9.9 MB** (`ps`) |
+| Cold listen | **&lt; 10 ms** |
+| `kill -9` during writes | Restart served through offset **`99999`**, no duplicate keys in that test |
 
-## 🔍 Architectural Flaws & Remediation Audit
+Reproduce:
 
-True engineering maturity requires complete transparency regarding current technical debt and edge cases. A deep-dive audit has identified **14 architectural flaws and performance bottlenecks** in the current v0.1.0 engine.
+```bash
+./target/release/vortex-cli bench --topic bench-10k --messages 10000 --size 256
+./target/release/vortex-cli bench --topic bench-stream --messages 50000 --size 512
+./target/release/vortex-cli bench --topic huge-100k --messages 100000 --size 512
+./target/release/vortex-cli bench --topic mega-payloads --messages 100 --size 524288
+```
 
-The full audit and remediation specs are documented in [`VORTEX_FLAWS_AND_VULNERABILITIES.md`](file:///Users/personal/Desktop/kafka/VORTEX_FLAWS_AND_VULNERABILITIES.md):
-
-* **Disk I/O Syscall Thrashing:** `append()` jumps back and forth 50 MB between Region A (byte 256) and Region B (data) using `_lseek` during index flushes $\to$ *Remediation: Migrate to atomic positional `write_all_at` / `pread`.*
-* **The 260 MB Sparse Index Ceiling:** The 64 KB sparse index caps out at 4,080 entries. Segments $> 260\text{ MB}$ silently stop indexing, forcing consumers into linear scans $\to$ *Remediation: Dynamic index capacity scaling.*
-* **Producer/Consumer Mutex Starvation:** `PartitionLog` requires `&mut self` on both `append()` and `read()`, forcing exclusive lock contention $\to$ *Remediation: Decouple positional read paths using atomic tail pointers.*
-* **Volatile In-Memory Key Registry:** `shredded_entities` is stored in an unpersisted `HashSet` that resets upon broker restart $\to$ *Remediation: Add write-ahead persistence log (`shredded_keys.wal`).*
-* **ChaCha20-Poly1305 Nonce Reuse:** Reusing partition offset as `nonce_val` across multiple partitions reuses keystream $\to$ *Remediation: Derive 96-bit nonces from Blake3 hash of topic, partition, offset, and timestamp.*
-* **Wire Guard Binary Bypass:** `PiiScanner` skips non-UTF8 payloads, leaving compressed (`snappy`/`zstd`) and binary (`Avro`/`Protobuf`) streams uninspected $\to$ *Remediation: Add wire-level decompression and string literal table scanning.*
-* **Unbounded TCP Read Buffers:** `connection.rs` buffers bytes without maximum limits $\to$ *Remediation: Enforce strict 16 MB frame ceilings.*
+Full write-up: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 ---
 
-## 🗺️ Roadmap
+## Limits (so the playground stays honest)
 
-Later work is ordered to preserve the sub-3 MB binary, the 9.9 MB RSS baseline, and microsecond-level p99 latency:
+| Reality in v0.1.0 | Why it matters |
+| :--- | :--- |
+| Global `Mutex` around the partition map; each log needs `&mut` for append **and** read | Concurrent produce/consume on one partition serialize |
+| 64 KB sparse index (~4080 entries) | Very large segments can stop adding index points |
+| PII scan is UTF-8 text only | Avro/Protobuf/compressed blobs are not inspected |
+| Shred registry is in-memory | Broker restart forgets shredded entity IDs unless you persist keys (not built) |
+| No consumer groups / replication / TLS | Single machine; plaintext TCP |
 
-- [x] **Phase 1-4:** Core `.vtx` single-file storage, Blake3 chain audit, Tokio VTX1 protocol broker, and benchmark suite.
-- [x] **Phase 5:** Cluster membership discovery & SWIM gossip protocol.
-- [x] **Phase 6:** Sub-microsecond crypto-shredding, zero-knowledge blind indexing, ingress PII quarantine, and background scrubber.
-- [ ] **Phase 7.1:** Kafka Wire Protocol Bridge (`vortex-bridge` on port 9092) supporting `ApiVersions`, `Metadata`, `Produce`, and `Fetch`.
-- [ ] **Phase 7.2:** Positional zero-copy `pread` refactor & dynamic sparse index expansion.
-- [ ] **Phase 7.3:** Write-ahead persistent key registry (`shredded_keys.wal`) & non-colliding 96-bit nonces.
-- [ ] **Phase 7.4:** Dynamic Leader-to-Follower pipelined replication with monotonic `LeaderEpoch` fencing.
-- [ ] **Phase 7.5:** Server-side consumer group coordination and `__consumer_offsets` partition management.
+---
+
+## Roadmap
+
+Order is meant to keep the small binary, ~10 MB RSS path, and linger=0 produce working. Clustering should stay a **feature flag**, not the default server.
+
+| | Intent | Status |
+| :--- | :--- | :--- |
+| **Now** | `.vtx` log, VTX1, Blake3 chain, PII quarantine, CLI labs | **This tree** |
+| **Next** | Batched produce, per-partition tasks, explicit `acks` | Planned |
+| | Merkle **batch** proofs + offline verify | Planned |
+| | Retention / lineage manifest; compaction as a new generation | Planned |
+| | CLI linger + cooperative groups (one node) | Planned |
+| | Metadata Raft + hash-equal replica acks (`cluster` feature) | Planned |
+| | `vortex-py` / Kafka protocol subset; TLS; compression | Later |
+
+Until those land, treat Vortex as a **single-node, hash-chained log** you can build, quarantine, scrub, and bench.
 
 ---
 
 <div align="center">
 
-**Apache-2.0 License** · Built with Rust · Verified with REA
+**Vortex** · Rust workspace · `cargo test --workspace`
 
 `cargo build --release && ./target/release/vortex-server`
 
