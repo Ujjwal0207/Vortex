@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use bytes::Bytes;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use vortex_core::error::Result;
-use vortex_core::tx::TransactionCoordinator;
 use vortex_guard::{IngressValidator, QuarantinedEvent, ValidationConfig};
 use vortex_protocol::{
     CreateTopicRequest, CreateTopicResponse, ErrorResponse, FetchRequest, FetchResponse, Frame,
@@ -17,7 +17,6 @@ pub struct Engine {
     data_dir: PathBuf,
     validator: IngressValidator,
     partitions: RwLock<HashMap<(String, u32), Arc<RwLock<PartitionLog>>>>,
-    tx_coordinator: Arc<TransactionCoordinator>,
 }
 
 impl Engine {
@@ -27,12 +26,7 @@ impl Engine {
             data_dir,
             validator,
             partitions: RwLock::new(HashMap::new()),
-            tx_coordinator: Arc::new(TransactionCoordinator::new()),
         }
-    }
-
-    pub fn tx_coordinator(&self) -> &Arc<TransactionCoordinator> {
-        &self.tx_coordinator
     }
 
     /// Handles a raw client frame and produces an appropriate response frame.
@@ -104,12 +98,53 @@ impl Engine {
         })
     }
 
+    /// Validates every record before appending any of them. This prevents a
+    /// later policy rejection from leaving the accepted prefix of a Kafka batch
+    /// in the user partition.
+    pub async fn produce_batch(
+        &self,
+        topic: &str,
+        partition_id: u32,
+        records: Vec<(Option<Bytes>, Bytes, Option<u64>)>,
+    ) -> Result<Vec<ProduceResponse>> {
+        check_ingress_watermark(&self.data_dir)?;
+
+        for (key, value, _) in &records {
+            if let Err(error) = self.validator.validate(topic, key.as_ref(), value) {
+                warn!("Poison pill rejected on topic '{}': {}", topic, error);
+                let quarantined = QuarantinedEvent::new(topic, &error.to_string(), key.as_ref(), value);
+                self.route_to_quarantine(quarantined).await?;
+                return Err(error);
+            }
+        }
+
+        let partition = self.get_or_create_partition(topic, partition_id).await?;
+        let mut log = partition.write().await;
+        let records = log.append_batch(records)?;
+        let responses = records
+            .into_iter()
+            .map(|record| ProduceResponse {
+                offset: record.offset,
+                timestamp: record.timestamp,
+                record_hash: record.record_hash,
+            })
+            .collect();
+        Ok(responses)
+    }
+
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse> {
         let partition = self.get_or_create_partition(&req.topic, req.partition).await?;
         let log = partition.read().await;
 
         let records = log.read(req.start_offset, req.max_bytes as usize)?;
         Ok(FetchResponse { records })
+    }
+
+    /// Returns retained and next offsets without reading record payloads.
+    pub async fn partition_bounds(&self, topic: &str, partition_id: u32) -> Result<(u64, u64)> {
+        let partition = self.get_or_create_partition(topic, partition_id).await?;
+        let log = partition.read().await;
+        Ok((log.earliest_offset(), log.next_offset()))
     }
 
     pub async fn create_topic(&self, topic: &str, partitions: u32) -> Result<CreateTopicResponse> {
