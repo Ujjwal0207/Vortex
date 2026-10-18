@@ -1,5 +1,6 @@
 use bytes::Buf;
-use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::time::Instant;
 
 use vortex_core::{
@@ -28,7 +29,9 @@ pub struct Scrubber;
 impl Scrubber {
     /// Autonomously scrubs a single .vtx segment file, verifying CRC32 framing
     /// and the complete continuous Blake3 SIMD cryptographic hash chain against silent bit-rot.
-    pub fn scrub_segment(segment: &mut Segment) -> Result<ScrubReport> {
+    /// Uses positional reads (`read_exact_at`) without mutating file pointers, allowing
+    /// autonomous background scrubbing without locking out active readers.
+    pub fn scrub_segment(segment: &Segment) -> Result<ScrubReport> {
         let start = Instant::now();
         let mut report = ScrubReport {
             records_scanned: 0,
@@ -51,18 +54,13 @@ impl Scrubber {
             return Ok(report);
         }
 
-        segment
-            .file
-            .seek(SeekFrom::Start(HEADER_INDEX_REGION_SIZE))
-            .map_err(|e| VortexError::Io(e.to_string()))?;
-
         let mut curr_pos = HEADER_INDEX_REGION_SIZE;
         let mut expected_prev_hash: HashDigest = segment.genesis_hash;
 
         while curr_pos < file_len {
-            // Read 4-byte total_len
+            // Read 4-byte total_len via positional read
             let mut len_buf = [0u8; 4];
-            if let Err(e) = segment.file.read_exact(&mut len_buf) {
+            if let Err(e) = segment.file.read_exact_at(&mut len_buf, curr_pos) {
                 report.details.push(format!("Truncated record at pos {}: {}", curr_pos, e));
                 report.healthy = false;
                 break;
@@ -79,9 +77,9 @@ impl Scrubber {
                 break;
             }
 
-            // Read the record body (crc32 + payload)
+            // Read the record body (crc32 + payload) via positional read
             let mut body_buf = vec![0u8; total_len as usize];
-            if let Err(e) = segment.file.read_exact(&mut body_buf) {
+            if let Err(e) = segment.file.read_exact_at(&mut body_buf, curr_pos + 4) {
                 report.details.push(format!("Read error at pos {}: {}", curr_pos, e));
                 report.healthy = false;
                 break;
@@ -164,8 +162,8 @@ impl Scrubber {
         Ok(report)
     }
 
-    /// Autonomously scrubs all segments of a partition log.
-    pub fn scrub_partition(partition: &mut PartitionLog) -> Result<ScrubReport> {
+    /// Autonomously scrubs all segments of a partition log without taking exclusive write locks.
+    pub fn scrub_partition(partition: &PartitionLog) -> Result<ScrubReport> {
         let start = Instant::now();
         let mut aggregated = ScrubReport {
             records_scanned: 0,
@@ -177,7 +175,7 @@ impl Scrubber {
             details: Vec::new(),
         };
 
-        for segment in &mut partition.segments {
+        for segment in &partition.segments {
             let seg_report = Self::scrub_segment(segment)?;
             aggregated.records_scanned += seg_report.records_scanned;
             aggregated.bytes_scanned += seg_report.bytes_scanned;
@@ -212,20 +210,19 @@ mod tests {
         }
 
         // 1. Scrub healthy segment
-        let report = Scrubber::scrub_segment(&mut seg).unwrap();
+        let report = Scrubber::scrub_segment(&seg).unwrap();
         assert!(report.healthy);
         assert_eq!(report.records_scanned, 10);
         assert_eq!(report.corrupted_crc_count, 0);
         assert_eq!(report.broken_hash_chain_count, 0);
 
         // 2. Inject intentional bit-rot (tamper with a byte in record 2)
-        use std::io::Write;
-        seg.file.seek(SeekFrom::Start(HEADER_INDEX_REGION_SIZE + 15)).unwrap();
-        seg.file.write_all(&[0xFF]).unwrap();
-        seg.file.flush().unwrap();
+        #[cfg(unix)]
+        seg.file.write_all_at(&[0xFF], HEADER_INDEX_REGION_SIZE + 15).unwrap();
+        let _ = seg.file.sync_data();
 
         // 3. Scrub corrupted segment: must flag corruption
-        let corrupt_report = Scrubber::scrub_segment(&mut seg).unwrap();
+        let corrupt_report = Scrubber::scrub_segment(&seg).unwrap();
         assert!(!corrupt_report.healthy);
         assert!(corrupt_report.corrupted_crc_count > 0 || corrupt_report.broken_hash_chain_count > 0);
     }
