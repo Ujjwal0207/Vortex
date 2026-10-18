@@ -1,21 +1,23 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use vortex_core::error::Result;
+use vortex_core::tx::TransactionCoordinator;
 use vortex_guard::{IngressValidator, QuarantinedEvent, ValidationConfig};
 use vortex_protocol::{
     CreateTopicRequest, CreateTopicResponse, ErrorResponse, FetchRequest, FetchResponse, Frame,
     ProduceRequest, ProduceResponse,
 };
-use vortex_storage::{PartitionLog, DEFAULT_MAX_SEGMENT_BYTES};
+use vortex_storage::{check_ingress_watermark, PartitionLog, DEFAULT_MAX_SEGMENT_BYTES};
 
 pub struct Engine {
     data_dir: PathBuf,
     validator: IngressValidator,
-    partitions: Mutex<HashMap<(String, u32), Arc<Mutex<PartitionLog>>>>,
+    partitions: RwLock<HashMap<(String, u32), Arc<RwLock<PartitionLog>>>>,
+    tx_coordinator: Arc<TransactionCoordinator>,
 }
 
 impl Engine {
@@ -24,8 +26,13 @@ impl Engine {
         Self {
             data_dir,
             validator,
-            partitions: Mutex::new(HashMap::new()),
+            partitions: RwLock::new(HashMap::new()),
+            tx_coordinator: Arc::new(TransactionCoordinator::new()),
         }
+    }
+
+    pub fn tx_coordinator(&self) -> &Arc<TransactionCoordinator> {
+        &self.tx_coordinator
     }
 
     /// Handles a raw client frame and produces an appropriate response frame.
@@ -66,6 +73,9 @@ impl Engine {
     }
 
     pub async fn produce(&self, req: ProduceRequest) -> Result<ProduceResponse> {
+        // 0. Proactive storage watermark fencing (Gap 9): reject writes if disk usage >= 92%
+        check_ingress_watermark(&self.data_dir)?;
+
         // 1. Ingress validation & Poison-Pill Quarantine check
         if let Err(e) = self.validator.validate(&req.topic, req.key.as_ref(), &req.value) {
             warn!("Poison pill rejected on topic '{}': {}", req.topic, e);
@@ -82,7 +92,7 @@ impl Engine {
 
         // 2. Fetch or create partition log
         let partition = self.get_or_create_partition(&req.topic, req.partition).await?;
-        let mut log = partition.lock().await;
+        let mut log = partition.write().await;
 
         // 3. Append to partition
         let record = log.append(req.key, req.value)?;
@@ -96,7 +106,7 @@ impl Engine {
 
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse> {
         let partition = self.get_or_create_partition(&req.topic, req.partition).await?;
-        let mut log = partition.lock().await;
+        let log = partition.read().await;
 
         let records = log.read(req.start_offset, req.max_bytes as usize)?;
         Ok(FetchResponse { records })
@@ -113,7 +123,7 @@ impl Engine {
     async fn route_to_quarantine(&self, event: QuarantinedEvent) -> Result<()> {
         let quarantine_topic = format!("{}.__quarantine", event.topic);
         let partition = self.get_or_create_partition(&quarantine_topic, 0).await?;
-        let mut log = partition.lock().await;
+        let mut log = partition.write().await;
         log.append(None, event.to_bytes())?;
         Ok(())
     }
@@ -122,10 +132,19 @@ impl Engine {
         &self,
         topic: &str,
         partition_id: u32,
-    ) -> Result<Arc<Mutex<PartitionLog>>> {
-        let mut parts = self.partitions.lock().await;
+    ) -> Result<Arc<RwLock<PartitionLog>>> {
         let key = (topic.to_string(), partition_id);
 
+        // Fast path: concurrent read lock for existing partitions
+        {
+            let parts = self.partitions.read().await;
+            if let Some(part) = parts.get(&key) {
+                return Ok(Arc::clone(part));
+            }
+        }
+
+        // Slow path: write lock to initialize and insert new partition log
+        let mut parts = self.partitions.write().await;
         if let Some(part) = parts.get(&key) {
             return Ok(Arc::clone(part));
         }
@@ -137,7 +156,7 @@ impl Engine {
             DEFAULT_MAX_SEGMENT_BYTES,
         )?;
 
-        let shared = Arc::new(Mutex::new(log));
+        let shared = Arc::new(RwLock::new(log));
         parts.insert(key, Arc::clone(&shared));
         Ok(shared)
     }
