@@ -101,7 +101,8 @@ impl PartitionLog {
     }
 
     /// Reads records starting from `start_offset` across segments up to `max_bytes`.
-    pub fn read(&mut self, start_offset: u64, max_bytes: usize) -> Result<Vec<Record>> {
+    /// Takes `&self` to allow concurrent readers without holding an exclusive lock.
+    pub fn read(&self, start_offset: u64, max_bytes: usize) -> Result<Vec<Record>> {
         if self.segments.is_empty() {
             return Ok(Vec::new());
         }
@@ -109,7 +110,15 @@ impl PartitionLog {
         let first_offset = self.segments[0].base_offset;
         let next_offset = self.next_offset();
 
-        if start_offset < first_offset || start_offset >= next_offset {
+        if start_offset < first_offset {
+            return Err(VortexError::OffsetOutOfRange {
+                requested: start_offset,
+                earliest: first_offset,
+                latest: next_offset,
+            });
+        }
+
+        if start_offset >= next_offset {
             return Ok(Vec::new());
         }
 
@@ -126,7 +135,7 @@ impl PartitionLog {
         let mut curr_offset = start_offset;
         let mut bytes_accumulated = 0;
 
-        for seg in &mut self.segments[seg_idx..] {
+        for seg in &self.segments[seg_idx..] {
             if bytes_accumulated >= max_bytes {
                 break;
             }
@@ -147,6 +156,53 @@ impl PartitionLog {
         }
 
         Ok(records)
+    }
+
+    /// Prunes expired sealed segments based on size (retention_bytes) and time (retention_ms).
+    /// The active segment is NEVER pruned to guarantee append continuity.
+    /// Returns the list of pruned segment base offsets.
+    pub fn prune_retention(
+        &mut self,
+        now_ms: u64,
+        retention_ms: Option<u64>,
+        retention_bytes: Option<u64>,
+    ) -> Result<Vec<u64>> {
+        let mut pruned = Vec::new();
+
+        while self.segments.len() > 1 {
+            let total_size: u64 = self.segments.iter().map(|s| s.size()).sum();
+            let oldest_seg = &self.segments[0];
+
+            let should_prune_size = retention_bytes.map_or(false, |limit| total_size > limit);
+            let should_prune_time = retention_ms.map_or(false, |limit_ms| {
+                let cutoff = now_ms.saturating_sub(limit_ms);
+                if let Ok(meta) = oldest_seg.file.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        let dur = modified
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default();
+                        dur.as_millis() < cutoff as u128
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            });
+
+            if should_prune_size || should_prune_time {
+                let seg = self.segments.remove(0);
+                let base = seg.base_offset;
+                drop(seg); // close file handle before unlink
+                let path = self.dir.join(format!("{:020}.vtx", base));
+                let _ = fs::remove_file(path);
+                pruned.push(base);
+            } else {
+                break;
+            }
+        }
+
+        Ok(pruned)
     }
 
     /// Flushes the active segment to disk.
@@ -213,4 +269,45 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_retention_pruning_and_out_of_range() {
+        let dir = tempdir().unwrap();
+
+        // Roll rapidly (small segment byte limit)
+        let mut log = PartitionLog::open_or_create(dir.path(), "retention_topic", 0, 800).unwrap();
+
+        for i in 0..40 {
+            log.append(None, Bytes::from(format!("val-{:020}", i))).unwrap();
+        }
+
+        assert!(log.segments.len() > 2);
+        let initial_seg_count = log.segments.len();
+
+        // Prune with a small retention_bytes limit (e.g. 1000 bytes)
+        let pruned = log.prune_retention(1_000_000, None, Some(1000)).unwrap();
+        assert!(!pruned.is_empty(), "Expected at least 1 segment pruned");
+        assert!(log.segments.len() < initial_seg_count);
+        assert!(log.segments.len() >= 1, "Active segment must be preserved");
+
+        let earliest = log.segments[0].base_offset;
+        assert!(earliest > 0);
+
+        // Reading an offset prior to earliest must return OffsetOutOfRange error
+        let err = log.read(0, 1024).unwrap_err();
+        match err {
+            VortexError::OffsetOutOfRange { requested, earliest: e, latest } => {
+                assert_eq!(requested, 0);
+                assert_eq!(e, earliest);
+                assert_eq!(latest, log.next_offset());
+            }
+            other => panic!("Expected OffsetOutOfRange, got {:?}", other),
+        }
+
+        // Reading from earliest valid offset must succeed
+        let valid_records = log.read(earliest, 1024).unwrap();
+        assert!(!valid_records.is_empty());
+        assert_eq!(valid_records[0].offset, earliest);
+    }
 }
+
