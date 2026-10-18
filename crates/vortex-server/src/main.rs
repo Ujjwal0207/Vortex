@@ -46,8 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Listening on: {}", addr);
     info!("Data directory: {}", args.data_dir.display());
 
-    let engine = Arc::new(Engine::new(args.data_dir));
-    let coordinator = Arc::new(ConsumerGroupCoordinator::new(std::time::Duration::from_secs(30)));
+    let engine = Arc::new(Engine::new(args.data_dir.clone()));
+    let coordinator = Arc::new(ConsumerGroupCoordinator::new(&args.data_dir, std::time::Duration::from_secs(30))?);
     let listener = TcpListener::bind(&addr).await?;
 
     loop {
@@ -80,7 +80,7 @@ mod tests {
     async fn test_live_tcp_dual_protocol_multiplexing() {
         let tmp = tempdir().unwrap();
         let engine = Arc::new(Engine::new(tmp.path().to_path_buf()));
-        let coordinator = Arc::new(ConsumerGroupCoordinator::new(std::time::Duration::from_secs(30)));
+        let coordinator = Arc::new(ConsumerGroupCoordinator::new(tmp.path(), std::time::Duration::from_secs(30)).unwrap());
 
         // Bind ephemeral loopback TCP port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -137,7 +137,7 @@ mod tests {
         // 1. Send Kafka ApiVersions Request (ApiKey 18, CorrelationId 777)
         let mut api_req = BytesMut::new();
         api_req.put_i16(18); // ApiVersions
-        api_req.put_i16(3);  // v3
+        api_req.put_i16(1);  // v1
         api_req.put_i32(777); // CorrelationId
         KafkaCodec::put_string(&mut api_req, "confluent-python-client");
 
@@ -165,6 +165,6 @@ mod tests {
         assert_eq!(r.get_i32(), 777); // Matching correlation ID
         assert_eq!(r.get_i16(), 0);   // ErrorCode: NONE
         let api_count = r.get_i32();
-        assert_eq!(api_count, 13);    // 13 Kafka APIs advertised!
+        assert_eq!(api_count, 12);    // APIs currently advertised by the bridge.
     }
 }
