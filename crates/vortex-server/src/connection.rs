@@ -81,6 +81,12 @@ pub async fn handle_connection(
                     )
                     .await;
 
+                    if response_bytes.is_empty() {
+                        // The bridge uses an empty result for unknown APIs and
+                        // unsupported versions whose response schema is unknown.
+                        break;
+                    }
+
                     if tx.send(response_bytes).await.is_err() {
                         break;
                     }
