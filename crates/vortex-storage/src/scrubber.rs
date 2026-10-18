@@ -1,4 +1,3 @@
-use bytes::Buf;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::time::Instant;
@@ -56,6 +55,7 @@ impl Scrubber {
 
         let mut curr_pos = HEADER_INDEX_REGION_SIZE;
         let mut expected_prev_hash: HashDigest = segment.genesis_hash;
+        let mut body_buf = Vec::new();
 
         while curr_pos < file_len {
             // Read 4-byte total_len via positional read
@@ -67,7 +67,9 @@ impl Scrubber {
             }
 
             let total_len = u32::from_be_bytes(len_buf) as u64;
-            if total_len < 4 + RECORD_HEADER_SIZE as u64 || curr_pos + 4 + total_len > file_len {
+            if total_len < (RECORD_HEADER_SIZE - 4) as u64
+                || curr_pos.checked_add(4 + total_len).map_or(true, |end| end > file_len)
+            {
                 report.details.push(format!(
                     "Invalid record length {} at physical pos {}",
                     total_len, curr_pos
@@ -78,17 +80,21 @@ impl Scrubber {
             }
 
             // Read the record body (crc32 + payload) via positional read
-            let mut body_buf = vec![0u8; total_len as usize];
+            let Ok(body_len) = usize::try_from(total_len) else {
+                report.details.push(format!("Record at pos {} is too large for this platform", curr_pos));
+                report.healthy = false;
+                break;
+            };
+            body_buf.resize(body_len, 0);
             if let Err(e) = segment.file.read_exact_at(&mut body_buf, curr_pos + 4) {
                 report.details.push(format!("Read error at pos {}: {}", curr_pos, e));
                 report.healthy = false;
                 break;
             }
 
-            // Decode and verify CRC32
-            let mut slice = &body_buf[..];
-            let actual_crc = slice.get_u32();
-            let payload = slice;
+            // Decode and verify CRC32 without allocating a new payload per record.
+            let actual_crc = u32::from_be_bytes(body_buf[0..4].try_into().unwrap());
+            let payload = &body_buf[4..];
 
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(payload);
@@ -103,56 +109,43 @@ impl Scrubber {
                 ));
             }
 
-            // Decode record fields
-            let mut record_slice = payload;
-            let offset = record_slice.get_u64();
-            let timestamp = record_slice.get_u64();
-
-            let mut prev_hash = [0u8; 32];
-            record_slice.copy_to_slice(&mut prev_hash);
-
-            let mut record_hash = [0u8; 32];
-            record_slice.copy_to_slice(&mut record_hash);
-
-            let key_len = record_slice.get_i32();
-            let key = if key_len >= 0 {
-                let k = record_slice.copy_to_bytes(key_len as usize);
-                Some(k)
-            } else {
-                None
+            let parsed = match parse_record_payload(payload) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    report.details.push(format!("Invalid record at pos {}: {}", curr_pos, message));
+                    report.healthy = false;
+                    break;
+                }
             };
 
-            let val_len = record_slice.get_u32() as usize;
-            let value = record_slice.copy_to_bytes(val_len);
-
             // Verify Blake3 hash chain
-            if prev_hash != expected_prev_hash {
+            if parsed.prev_hash != expected_prev_hash {
                 report.broken_hash_chain_count += 1;
                 report.healthy = false;
                 report.details.push(format!(
                     "Blake3 chain break at offset {}: expected prev_hash {:?}, found {:?}",
-                    offset, expected_prev_hash, prev_hash
+                    parsed.offset, expected_prev_hash, parsed.prev_hash
                 ));
             }
 
             let computed_hash = compute_record_hash(
-                &prev_hash,
-                offset,
-                timestamp,
-                key.as_deref(),
-                &value,
+                &parsed.prev_hash,
+                parsed.offset,
+                parsed.timestamp,
+                parsed.key,
+                parsed.value,
             );
 
-            if computed_hash != record_hash {
+            if computed_hash != parsed.record_hash {
                 report.broken_hash_chain_count += 1;
                 report.healthy = false;
                 report.details.push(format!(
                     "Blake3 record tamper detected at offset {}: computed {:?}, recorded {:?}",
-                    offset, computed_hash, record_hash
+                    parsed.offset, computed_hash, parsed.record_hash
                 ));
             }
 
-            expected_prev_hash = record_hash;
+            expected_prev_hash = parsed.record_hash;
             report.records_scanned += 1;
             report.bytes_scanned += 4 + total_len;
             curr_pos += 4 + total_len;
@@ -190,6 +183,57 @@ impl Scrubber {
         aggregated.scan_duration_ms = start.elapsed().as_millis() as u64;
         Ok(aggregated)
     }
+}
+
+struct ParsedRecord<'a> {
+    offset: u64,
+    timestamp: u64,
+    prev_hash: HashDigest,
+    record_hash: HashDigest,
+    key: Option<&'a [u8]>,
+    value: &'a [u8],
+}
+
+fn parse_record_payload(payload: &[u8]) -> std::result::Result<ParsedRecord<'_>, &'static str> {
+    const FIXED_PREFIX: usize = 8 + 8 + 32 + 32 + 4;
+    if payload.len() < FIXED_PREFIX + 4 {
+        return Err("payload is shorter than the record header");
+    }
+
+    let offset = u64::from_be_bytes(payload[0..8].try_into().unwrap());
+    let timestamp = u64::from_be_bytes(payload[8..16].try_into().unwrap());
+    let prev_hash: HashDigest = payload[16..48].try_into().unwrap();
+    let record_hash: HashDigest = payload[48..80].try_into().unwrap();
+    let key_len = i32::from_be_bytes(payload[80..84].try_into().unwrap());
+    if key_len < -1 {
+        return Err("invalid negative key length");
+    }
+
+    let (key, value_len_pos) = if key_len == -1 {
+        (None, 84)
+    } else {
+        let key_len = key_len as usize;
+        let key_end = 84usize.checked_add(key_len).ok_or("key length overflow")?;
+        if key_end.checked_add(4).map_or(true, |end| end > payload.len()) {
+            return Err("key extends beyond the record payload");
+        }
+        (Some(&payload[84..key_end]), key_end)
+    };
+
+    let value_len = u32::from_be_bytes(payload[value_len_pos..value_len_pos + 4].try_into().unwrap()) as usize;
+    let value_start = value_len_pos + 4;
+    if value_start.checked_add(value_len) != Some(payload.len()) {
+        return Err("value length does not match the remaining payload");
+    }
+
+    Ok(ParsedRecord {
+        offset,
+        timestamp,
+        prev_hash,
+        record_hash,
+        key,
+        value: &payload[value_start..],
+    })
 }
 
 #[cfg(test)]
