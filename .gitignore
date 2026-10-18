@@ -70,3 +70,7 @@ build/
 # Environment & Secrets
 .env
 .env.*
+
+# Local Phase 7 review notes
+/PHASE_7_CURE_PLAN_2026-10-18.md
+/REMEDIATION_AUDIT_2026-10-18.md
