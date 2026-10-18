@@ -79,6 +79,33 @@ pub enum VortexError {
 
     #[error("Decryption failed: {0}")]
     DecryptionError(String),
+
+    #[error("Storage disk watermark exceeded: usage {usage_percent}% exceeds ingress threshold {threshold}%; writes rejected to prevent ENOSPC corruption")]
+    DiskQuasiFull {
+        usage_percent: u8,
+        threshold: u8,
+    },
+
+    #[error("Fenced leader epoch: current cluster epoch is {current}, but request attempted with stale epoch {attempted}")]
+    FencedLeaderEpoch {
+        current: u32,
+        attempted: u32,
+    },
+
+    #[error("Fenced consumer member epoch for group '{group_id}' member '{member_id}': active epoch is {current}, attempted {attempted}")]
+    FencedMemberEpoch {
+        group_id: String,
+        member_id: String,
+        current: u32,
+        attempted: u32,
+    },
+
+    #[error("Offset {requested} out of range (retention pruned or uncommitted); valid offset window is [{earliest}..{latest})")]
+    OffsetOutOfRange {
+        requested: u64,
+        earliest: u64,
+        latest: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, VortexError>;
