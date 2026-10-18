@@ -13,6 +13,9 @@ pub const SEGMENT_MAGIC: u32 = 0x56545831; // "VTX1"
 pub const SEGMENT_VERSION: u8 = 1;
 pub const INDEX_ENTRY_SIZE: usize = 16;
 pub const MAX_INDEX_ENTRIES: usize = (HEADER_INDEX_REGION_SIZE as usize - 256) / INDEX_ENTRY_SIZE;
+const COMMIT_STATE_MAGIC: u32 = 0x5654_5843; // "VTXC"
+const COMMIT_STATE_VERSION: u8 = 1;
+const COMMIT_STATE_SIZE: usize = 60;
 
 /// Sparse index checkpoint interval in bytes (record one index entry every 64 KB of data).
 pub const SPARSE_INDEX_INTERVAL_BYTES: u64 = 64 * 1024;
@@ -35,6 +38,8 @@ pub struct Segment {
     pub index_entries: Vec<IndexEntry>,
     pub current_data_position: u64,
     pub bytes_since_last_index: u64,
+    commit_path: PathBuf,
+    poisoned: bool,
 }
 
 impl Segment {
@@ -75,6 +80,15 @@ impl Segment {
             file.sync_data()
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
+            let commit_path = commit_state_path(&path);
+            publish_commit_state(
+                &path,
+                &commit_path,
+                HEADER_INDEX_REGION_SIZE,
+                base_offset,
+                genesis_hash,
+            )?;
+
             Ok(Self {
                 base_offset,
                 next_offset: base_offset,
@@ -86,6 +100,8 @@ impl Segment {
                 index_entries: Vec::new(),
                 current_data_position: HEADER_INDEX_REGION_SIZE,
                 bytes_since_last_index: 0,
+                commit_path,
+                poisoned: false,
             })
         } else {
             // Recover and validate existing segment
@@ -121,7 +137,9 @@ impl Segment {
         // survive restart, and so a torn or stale index cannot direct reads wrongly.
         let _stored_index_count = u32::from_be_bytes(header_buf[252..256].try_into().unwrap());
 
-        // Validate data region and recover next_offset & last_record_hash
+        // A sidecar records the durable end of the last complete append batch. Bytes
+        // beyond that boundary are an uncommitted tail and are discarded on recovery.
+        // Segments written before this marker existed are scanned once and upgraded.
         let file_len = file
             .metadata()
             .map_err(|e| VortexError::Io(e.to_string()))?
@@ -135,16 +153,42 @@ impl Segment {
             )));
         }
 
+        let commit_path = commit_state_path(&path);
+        let commit_state = read_commit_state(&commit_path)?;
+        let scan_end = match commit_state {
+            Some(state) => {
+                if state.end_position < HEADER_INDEX_REGION_SIZE || state.end_position > file_len {
+                    return Err(VortexError::Io(format!(
+                        "segment commit boundary {} is outside the data file (length {file_len})",
+                        state.end_position
+                    )));
+                }
+                if file_len > state.end_position {
+                    file.set_len(state.end_position)
+                        .and_then(|_| file.sync_data())
+                        .map_err(|e| VortexError::Io(format!("failed to discard uncommitted segment tail: {e}")))?;
+                }
+                state.end_position
+            }
+            None => file_len,
+        };
+
         let mut curr_pos = HEADER_INDEX_REGION_SIZE;
         let mut next_offset = base_offset;
         let mut last_hash = genesis_hash;
         let mut index_entries = Vec::new();
         let mut last_indexed_pos = HEADER_INDEX_REGION_SIZE;
 
-        while curr_pos < file_len {
-            if file_len - curr_pos < 4 {
+        while curr_pos < scan_end {
+            if scan_end - curr_pos < 4 {
+                if commit_state.is_some() {
+                    return Err(VortexError::Io(format!(
+                        "commit marker ends inside a record length at byte {curr_pos}"
+                    )));
+                }
                 file.set_len(curr_pos)
                     .map_err(|e| VortexError::Io(e.to_string()))?;
+                file.sync_data().map_err(|e| VortexError::Io(e.to_string()))?;
                 break;
             }
             let mut len_buf = [0u8; 4];
@@ -162,10 +206,17 @@ impl Segment {
                 .checked_add(4)
                 .and_then(|p| p.checked_add(total_len))
                 .ok_or_else(|| VortexError::Io("record end offset overflow".into()))?;
-            if record_end > file_len {
-                // Incomplete write found at tail (e.g. power-loss crash). Truncate to last valid boundary!
+            if record_end > scan_end {
+                if commit_state.is_some() {
+                    return Err(VortexError::Io(format!(
+                        "commit marker ends inside a record at byte {curr_pos}"
+                    )));
+                }
+                // Legacy segments have no batch boundary marker. Discard a physically
+                // incomplete final record, then establish a marker at the valid prefix.
                 file.set_len(curr_pos)
                     .map_err(|e| VortexError::Io(e.to_string()))?;
+                file.sync_data().map_err(|e| VortexError::Io(e.to_string()))?;
                 break;
             }
 
@@ -176,26 +227,8 @@ impl Segment {
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
             let mut slice = &record_raw[..];
-            let rec = match Record::decode(&mut slice) {
-                Ok(rec) => rec,
-                Err(_e) if record_end == file_len => {
-                    // Torn write at segment tail (e.g. power-loss crash mid-append).
-                    // Safely truncate to the last valid record boundary.
-                    file.set_len(curr_pos)
-                        .map_err(|io_err| VortexError::Io(io_err.to_string()))?;
-                    let _ = file.sync_data();
-                    break;
-                }
-                Err(e) => return Err(e),
-            };
+            let rec = Record::decode(&mut slice)?;
             if rec.offset != next_offset || rec.prev_hash != last_hash {
-                if record_end == file_len {
-                    // Torn lineage at the tail from partial write
-                    file.set_len(curr_pos)
-                        .map_err(|io_err| VortexError::Io(io_err.to_string()))?;
-                    let _ = file.sync_data();
-                    break;
-                }
                 return Err(VortexError::CryptographicLineageBroken {
                     offset: rec.offset,
                     expected: format!("{} at offset {}", hex_hash(&last_hash), next_offset),
@@ -223,6 +256,17 @@ impl Segment {
             curr_pos = record_end;
         }
 
+        if let Some(state) = commit_state {
+            if state.next_offset != next_offset || state.last_record_hash != last_hash {
+                return Err(VortexError::Io(format!(
+                    "segment commit marker disagrees with validated records in {}",
+                    path.display()
+                )));
+            }
+        } else {
+            publish_commit_state(&path, &commit_path, curr_pos, next_offset, last_hash)?;
+        }
+
         let bytes_since_last_index = curr_pos.saturating_sub(last_indexed_pos);
 
         let mmap = unsafe { MmapOptions::new().map(&file).ok() };
@@ -238,9 +282,11 @@ impl Segment {
             index_entries,
             current_data_position: curr_pos,
             bytes_since_last_index,
+            commit_path,
+            poisoned: false,
         };
         for (i, entry) in segment.index_entries.iter().take(MAX_INDEX_ENTRIES).enumerate() {
-            segment.write_index_entry(entry, i)?;
+            let _ = segment.write_index_entry(entry, i);
         }
         Ok(segment)
     }
@@ -261,19 +307,22 @@ impl Segment {
         Ok(results.remove(0))
     }
 
-    /// Appends an entire batch of records atomically using a single positional I/O write.
+    /// Appends a batch and advances a durable commit marker only after the data is synced.
     /// Invariants:
     /// - Stages all records, hashes, and offsets in memory before touching disk.
-    /// - Writes the concatenated batch buffer to disk via a single `write_all_at`.
-    /// - Advances memory pointers (`current_data_position`, `next_offset`, `last_record_hash`)
-    ///   ONLY after the physical write returns successfully.
-    /// - If the write fails, memory state remains completely unmutated.
+    /// - Writes and syncs all encoded records before publishing the new boundary.
+    /// - Recovery truncates any data beyond the last atomically published boundary.
+    /// - A failure while publishing the boundary poisons this segment until restart,
+    ///   because a rename followed by a directory-sync failure has an uncertain outcome.
     pub fn append_batch(
         &mut self,
         batch: Vec<(Option<Bytes>, Bytes, Option<u64>)>,
     ) -> Result<Vec<Record>> {
         if batch.is_empty() {
             return Ok(Vec::new());
+        }
+        if self.poisoned {
+            return Err(VortexError::Io("segment is poisoned after an uncertain commit; restart required".into()));
         }
 
         let mut curr_offset = self.next_offset;
@@ -333,17 +382,40 @@ impl Segment {
             buffer.extend_from_slice(&enc);
         }
 
-        // Atomic write of the entire batch at the current physical position
-        self.file
-            .write_all_at(&buffer, self.current_data_position)
-            .map_err(|e| VortexError::Io(e.to_string()))?;
+        let old_position = self.current_data_position;
+        if let Err(error) = self.file.write_all_at(&buffer, old_position)
+            .and_then(|_| self.file.sync_data())
+        {
+            if let Err(rollback) = self.file.set_len(old_position).and_then(|_| self.file.sync_data()) {
+                self.poisoned = true;
+                return Err(VortexError::Io(format!(
+                    "segment batch write failed ({error}); rollback failed ({rollback}); restart required"
+                )));
+            }
+            return Err(VortexError::Io(error.to_string()));
+        }
+
+        if let Err(error) = publish_commit_state(
+            &self.path,
+            &self.commit_path,
+            curr_pos,
+            curr_offset,
+            curr_hash,
+        ) {
+            self.poisoned = true;
+            return Err(VortexError::Io(format!(
+                "segment batch data was written but commit publication is uncertain ({error}); restart required"
+            )));
+        }
 
         // Write new index entries to Region A header on disk up to MAX_INDEX_ENTRIES
         let current_index_count = self.index_entries.len();
         for (i, entry) in new_index_entries.iter().enumerate() {
             let target_idx = current_index_count + i;
             if target_idx < MAX_INDEX_ENTRIES {
-                self.write_index_entry(entry, target_idx)?;
+                // The index is a rebuildable cache. A cache write failure must not
+                // turn a durably committed batch into an apparent failed append.
+                let _ = self.write_index_entry(entry, target_idx);
             }
         }
 
@@ -457,6 +529,88 @@ impl Segment {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CommitState {
+    end_position: u64,
+    next_offset: u64,
+    last_record_hash: HashDigest,
+}
+
+pub(crate) fn commit_state_path(segment_path: &Path) -> PathBuf {
+    let name = segment_path.file_name().expect("segment path has a filename");
+    let mut sidecar_name = name.to_os_string();
+    sidecar_name.push(".commit");
+    segment_path.with_file_name(sidecar_name)
+}
+
+fn read_commit_state(path: &Path) -> Result<Option<CommitState>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(VortexError::Io(format!("failed to open segment commit marker: {error}"))),
+    };
+    let length = file.metadata().map_err(|e| VortexError::Io(e.to_string()))?.len();
+    if length != COMMIT_STATE_SIZE as u64 {
+        return Err(VortexError::Io(format!("invalid segment commit marker length {length}")));
+    }
+    let mut bytes = [0u8; COMMIT_STATE_SIZE];
+    std::io::Read::read_exact(&mut file, &mut bytes)
+        .map_err(|e| VortexError::Io(format!("failed to read segment commit marker: {e}")))?;
+    let magic = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+    let version = bytes[4];
+    let expected_crc = u32::from_be_bytes(bytes[56..60].try_into().unwrap());
+    if magic != COMMIT_STATE_MAGIC
+        || version != COMMIT_STATE_VERSION
+        || crc32fast::hash(&bytes[..56]) != expected_crc
+    {
+        return Err(VortexError::Io("invalid or corrupt segment commit marker".into()));
+    }
+    let end_position = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+    let next_offset = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+    let mut last_record_hash = [0u8; 32];
+    last_record_hash.copy_from_slice(&bytes[24..56]);
+    Ok(Some(CommitState { end_position, next_offset, last_record_hash }))
+}
+
+fn publish_commit_state(
+    segment_path: &Path,
+    commit_path: &Path,
+    end_position: u64,
+    next_offset: u64,
+    last_record_hash: HashDigest,
+) -> Result<()> {
+    let mut bytes = [0u8; COMMIT_STATE_SIZE];
+    bytes[0..4].copy_from_slice(&COMMIT_STATE_MAGIC.to_be_bytes());
+    bytes[4] = COMMIT_STATE_VERSION;
+    bytes[8..16].copy_from_slice(&end_position.to_be_bytes());
+    bytes[16..24].copy_from_slice(&next_offset.to_be_bytes());
+    bytes[24..56].copy_from_slice(&last_record_hash);
+    let checksum = crc32fast::hash(&bytes[..56]);
+    bytes[56..60].copy_from_slice(&checksum.to_be_bytes());
+
+    let name = commit_path.file_name().expect("commit marker path has a filename");
+    let mut temp_name = name.to_os_string();
+    temp_name.push(".tmp");
+    let temp_path = commit_path.with_file_name(temp_name);
+    let mut temp = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(|e| VortexError::Io(format!("failed to create segment commit marker: {e}")))?;
+    std::io::Write::write_all(&mut temp, &bytes)
+        .and_then(|_| temp.sync_all())
+        .map_err(|e| VortexError::Io(format!("failed to persist segment commit marker: {e}")))?;
+    drop(temp);
+    std::fs::rename(&temp_path, commit_path)
+        .map_err(|e| VortexError::Io(format!("failed to publish segment commit marker: {e}")))?;
+
+    let parent = segment_path.parent().ok_or_else(|| VortexError::Io("segment has no parent directory".into()))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| VortexError::Io(format!("failed to sync segment directory after commit: {e}")))
+}
+
 fn hex_hash(hash: &HashDigest) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -545,5 +699,41 @@ mod tests {
         let new_rec = recovered.append(None, Bytes::from_static(b"record-5-after-crash")).unwrap();
         assert_eq!(new_rec.offset, 5);
         assert_eq!(recovered.next_offset, 6);
+    }
+
+    #[test]
+    fn recovery_discards_a_complete_but_uncommitted_batch_tail() {
+        let dir = tempdir().unwrap();
+        let genesis = compute_genesis_hash("uncommitted-batch", 0);
+        let seg = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
+        let committed_end = seg.size();
+
+        let first = Record::new(seg.last_record_hash, seg.next_offset, None, Bytes::from_static(b"one"));
+        let second = Record::new(first.record_hash, first.offset + 1, None, Bytes::from_static(b"two"));
+        let mut uncommitted = BytesMut::from(first.encode().as_ref());
+        uncommitted.extend_from_slice(second.encode().as_ref());
+        seg.file.write_all_at(&uncommitted, committed_end).unwrap();
+        seg.file.sync_data().unwrap();
+        drop(seg);
+
+        let recovered = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
+        assert_eq!(recovered.next_offset, 0);
+        assert_eq!(recovered.size(), committed_end);
+        assert!(recovered.read(0, 1024).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_segment_is_scanned_and_upgraded_to_commit_marker() {
+        let dir = tempdir().unwrap();
+        let genesis = compute_genesis_hash("legacy-segment", 0);
+        let mut seg = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
+        seg.append(None, Bytes::from_static(b"legacy record")).unwrap();
+        let segment_path = seg.path.clone();
+        drop(seg);
+
+        std::fs::remove_file(commit_state_path(&segment_path)).unwrap();
+        let recovered = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
+        assert_eq!(recovered.next_offset, 1);
+        assert!(commit_state_path(&segment_path).exists());
     }
 }
