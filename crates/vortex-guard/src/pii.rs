@@ -25,8 +25,8 @@ impl PiiScanner {
     /// 5. Credit Card Numbers (13-19 digits verified via Luhn algorithm)
     pub fn scan(&self, payload: &[u8], quarantine_on_detect: bool) -> PiiAction {
         let text = match std::str::from_utf8(payload) {
-            Ok(t) => t,
-            Err(_) => return PiiAction::Allow, // Binary payloads bypassed
+            Ok(t) => std::borrow::Cow::Borrowed(t),
+            Err(_) => String::from_utf8_lossy(payload),
         };
 
         // 1. AWS Key Detection: AKIA followed by 16 alphanumeric uppercase characters / digits
@@ -88,7 +88,7 @@ impl PiiScanner {
         }
 
         // 5. Credit Card Number Detection with Luhn algorithm validation
-        if let Some(card_number) = find_valid_credit_card(text) {
+        if let Some(card_number) = find_valid_credit_card(&text) {
             let reason = format!("Detected exposed Credit Card Number: '****-****-****-{}'", &card_number[card_number.len().saturating_sub(4)..]);
             return if quarantine_on_detect {
                 PiiAction::Quarantine(reason)
@@ -209,5 +209,17 @@ mod tests {
         let benign = b"Order ID: 12345678901234567";
         let action_benign = scanner.scan(benign, true);
         assert_eq!(action_benign, PiiAction::Allow);
+    }
+
+    #[test]
+    fn test_binary_payload_with_embedded_secret() {
+        let scanner = PiiScanner::new();
+        // Construct binary frame (e.g. Avro/Protobuf header with 0xFF 0xFE invalid UTF-8) containing an AWS key
+        let mut binary_payload = vec![0xFF, 0xFE, 0x00, 0x01];
+        binary_payload.extend_from_slice(b"AKIAIOSFODNN7EXAMPLE1");
+        binary_payload.extend_from_slice(&[0x00, 0x80, 0x99]);
+
+        let action = scanner.scan(&binary_payload, true);
+        assert!(matches!(action, PiiAction::Quarantine(_)));
     }
 }
