@@ -24,7 +24,7 @@ pub struct ConsumerGroupState {
     pub group_id: String,
     pub group_epoch: u32,
     pub members: HashMap<String, GroupMemberState>,
-    pub subscriptions: HashMap<String, u32>, // Topic -> PartitionCount
+    member_subscriptions: HashMap<String, HashMap<String, u32>>,
     pub committed_offsets: HashMap<(String, u32), i64>,
 }
 
@@ -34,13 +34,13 @@ impl ConsumerGroupState {
             group_id: group_id.to_string(),
             group_epoch: 1,
             members: HashMap::new(),
-            subscriptions: HashMap::new(),
+            member_subscriptions: HashMap::new(),
             committed_offsets: HashMap::new(),
         }
     }
 
-    /// Rebalances all subscribed topics deterministically across active members.
-    /// Updates member assignments and advances group_epoch for member-epoch fencing.
+    /// Performs a deterministic eager rebalance for subscribed members.
+    /// This is a classic stop-the-world assignment, not cooperative or KIP-848.
     pub fn rebalance(&mut self) {
         if self.members.is_empty() {
             return;
@@ -56,30 +56,42 @@ impl ConsumerGroupState {
             m.member_epoch = self.group_epoch;
         }
 
-        // Collect and sort topics deterministically
-        let mut topics: Vec<(String, u32)> = self
-            .subscriptions
-            .iter()
-            .map(|(t, p)| (t.clone(), *p))
-            .collect();
+        // Build each topic's eligible members from per-member subscriptions.
+        let mut topic_counts: HashMap<String, u32> = HashMap::new();
+        for subscriptions in self.member_subscriptions.values() {
+            for (topic, partition_count) in subscriptions {
+                topic_counts.entry(topic.clone())
+                    .and_modify(|count| *count = (*count).max(*partition_count))
+                    .or_insert(*partition_count);
+            }
+        }
+        let mut topics: Vec<(String, u32)> = topic_counts.into_iter().collect();
         topics.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Deterministically round-robin assign partitions across active members
+        let mut assignments: HashMap<String, Vec<(String, u32)>> = HashMap::new();
         for (topic, partition_count) in topics {
+            let eligible: Vec<&String> = member_ids.iter()
+                .filter(|member_id| self.member_subscriptions
+                    .get(*member_id)
+                    .is_some_and(|subscriptions| subscriptions.contains_key(&topic)))
+                .collect();
+            if eligible.is_empty() {
+                continue;
+            }
             for p in 0..partition_count {
-                let member_idx = (p as usize) % member_ids.len();
-                let target_member = &member_ids[member_idx];
-                if let Some(m) = self.members.get_mut(target_member) {
-                    m.assigned_partitions.push((topic.clone(), p));
-                }
+                let target_member = eligible[(p as usize) % eligible.len()];
+                assignments.entry(target_member.clone()).or_default().push((topic.clone(), p));
+            }
+        }
+        for (member_id, assigned) in assignments {
+            if let Some(member) = self.members.get_mut(&member_id) {
+                member.assigned_partitions = assigned;
             }
         }
     }
 }
 
-/// In-Broker Next-Gen Consumer Group Coordinator (Gap 6 / KIP-848 Parity).
-/// Eliminates Stop-the-World consumer rebalance storms and provides member-epoch fencing
-/// against stale ghost consumers.
+/// In-broker classic eager group coordinator with member-epoch fencing.
 pub struct ConsumerGroupCoordinator {
     groups: RwLock<HashMap<String, ConsumerGroupState>>,
     offsets_wal: Mutex<OffsetsWal>,
@@ -91,6 +103,7 @@ pub struct ConsumerGroupCoordinator {
 struct OffsetsWal {
     file: File,
     end: u64,
+    poisoned: bool,
 }
 
 const OFFSETS_WAL_MAGIC: u32 = 0x564f_4631; // "VOF1"
@@ -113,19 +126,22 @@ impl ConsumerGroupCoordinator {
             .write(true)
             .open(&wal_path)
             .map_err(|e| VortexError::Io(e.to_string()))?;
+        fs::File::open(data_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| VortexError::Io(format!("failed to sync offsets directory: {e}")))?;
         let (groups, wal_end) = replay_offsets_wal(&wal)?;
 
         Ok(Self {
             groups: RwLock::new(groups),
-            offsets_wal: Mutex::new(OffsetsWal { file: wal, end: wal_end }),
+            offsets_wal: Mutex::new(OffsetsWal { file: wal, end: wal_end, poisoned: false }),
             data_dir: data_dir.to_path_buf(),
             heartbeat_timeout,
             max_wal_bytes: std::sync::atomic::AtomicU64::new(DEFAULT_MAX_OFFSETS_WAL_BYTES),
         })
     }
 
-    /// Registers or heartbeats a consumer member within a group.
-    /// If member is new or subscriptions changed, triggers unified partition rebalance.
+    /// Registers a member or refreshes its full subscription set.
+    /// A subscription change triggers an eager rebalance.
     pub fn register_or_heartbeat(
         &self,
         group_id: &str,
@@ -155,17 +171,14 @@ impl ConsumerGroupCoordinator {
 
         member.heartbeat_expiry = expiry;
 
-        let mut subscriptions_changed = false;
+        let mut member_subscriptions = HashMap::new();
         for topic in topics {
-            let entry = group
-                .subscriptions
-                .entry(topic.clone())
-                .or_insert(partition_count);
-            if *entry != partition_count && partition_count > 0 {
-                *entry = partition_count;
-                subscriptions_changed = true;
+            if partition_count > 0 {
+                member_subscriptions.insert(topic.clone(), partition_count);
             }
         }
+        let subscriptions_changed = group.member_subscriptions.get(member_id) != Some(&member_subscriptions);
+        group.member_subscriptions.insert(member_id.to_string(), member_subscriptions);
 
         if is_new || subscriptions_changed {
             group.rebalance();
@@ -191,7 +204,7 @@ impl ConsumerGroupCoordinator {
             });
         }
         let mut groups = self.groups.write().unwrap();
-        let group = groups.get_mut(group_id).ok_or_else(|| {
+        let group = groups.get(group_id).ok_or_else(|| {
             VortexError::SecurityViolation {
                 reason: format!("Unknown consumer group '{}'", group_id),
             }
@@ -219,6 +232,15 @@ impl ConsumerGroupCoordinator {
 
         let wal_record = encode_offsets_wal_record(group_id, topic, partition, offset)?;
         let mut wal = self.offsets_wal.lock().unwrap();
+        if wal.poisoned {
+            return Err(VortexError::Io("offset WAL is in an uncertain state; restart required".into()));
+        }
+        let max_wal_bytes = self.max_wal_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if wal.end >= max_wal_bytes || wal.end.saturating_add(wal_record.len() as u64) > max_wal_bytes {
+            // Compact the existing, already durable offsets before appending. A
+            // failed compaction therefore cannot make this commit appear successful.
+            self.compact_wal_locked(&groups, &mut wal)?;
+        }
         let wal_start = wal.end;
         if let Err(e) = write_all_at(&wal.file, &wal_record, wal_start)
             .and_then(|_| wal.file.sync_data())
@@ -226,22 +248,19 @@ impl ConsumerGroupCoordinator {
             // Avoid placing later frames after a partially written record. If rollback
             // itself fails, fail this commit and let startup's checksum validation stop
             // the broker rather than silently skipping potentially durable state.
-            wal.file.set_len(wal_start).map_err(|truncate| {
-                VortexError::Io(format!(
-                    "offset WAL write failed ({e}); rollback failed ({truncate})"
-                ))
-            })?;
+            if let Err(truncate) = wal.file.set_len(wal_start).and_then(|_| wal.file.sync_data()) {
+                wal.poisoned = true;
+                return Err(VortexError::Io(format!(
+                    "offset WAL write failed ({e}); rollback failed ({truncate}); restart required"
+                )));
+            }
             return Err(VortexError::Io(e.to_string()));
         }
         wal.end = wal_start + wal_record.len() as u64;
 
-        group
+        groups.get_mut(group_id).expect("validated group remains present")
             .committed_offsets
             .insert((topic.to_string(), partition), offset);
-
-        if wal.end >= self.max_wal_bytes.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = self.compact_wal_locked(&groups, &mut wal);
-        }
 
         Ok(())
     }
@@ -291,10 +310,14 @@ impl ConsumerGroupCoordinator {
             }
         }
 
-        tmp_file.sync_data().map_err(|e| VortexError::Io(format!("failed to sync compacted offset WAL tmp file: {e}")))?;
+        tmp_file.sync_all().map_err(|e| VortexError::Io(format!("failed to sync compacted offset WAL tmp file: {e}")))?;
         drop(tmp_file);
 
         fs::rename(&tmp_path, &wal_path).map_err(|e| VortexError::Io(format!("failed to atomically replace offset WAL: {e}")))?;
+        // After replacement, the old open descriptor refers to the unlinked WAL.
+        // Block further commits until the replacement handle and directory entry
+        // have both been made durable.
+        wal.poisoned = true;
 
         let new_wal = OpenOptions::new()
             .read(true)
@@ -304,6 +327,10 @@ impl ConsumerGroupCoordinator {
 
         wal.file = new_wal;
         wal.end = offset;
+        fs::File::open(&self.data_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| VortexError::Io(format!("failed to sync offsets directory after WAL replacement: {e}")))?;
+        wal.poisoned = false;
 
         Ok(())
     }
@@ -337,6 +364,7 @@ impl ConsumerGroupCoordinator {
             if !stale.is_empty() {
                 for id in &stale {
                     group.members.remove(id);
+                    group.member_subscriptions.remove(id);
                     evicted.push(id.clone());
                 }
                 group.rebalance();
@@ -408,6 +436,7 @@ impl ConsumerGroupCoordinator {
         let mut groups = self.groups.write().unwrap();
         if let Some(group) = groups.get_mut(group_id) {
             if group.members.remove(member_id).is_some() {
+                group.member_subscriptions.remove(member_id);
                 group.rebalance();
             }
         }
@@ -466,6 +495,7 @@ fn replay_offsets_wal(wal: &File) -> Result<(HashMap<String, ConsumerGroupState>
             Ok(()) => position += OFFSETS_WAL_HEADER_SIZE as u64,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 wal.set_len(frame_start)
+                    .and_then(|_| wal.sync_data())
                     .map_err(|e| VortexError::Io(e.to_string()))?;
                 break;
             }
@@ -482,6 +512,7 @@ fn replay_offsets_wal(wal: &File) -> Result<(HashMap<String, ConsumerGroupState>
         }
         if position.saturating_add(body_len as u64) > file_len {
             wal.set_len(frame_start)
+                .and_then(|_| wal.sync_data())
                 .map_err(|e| VortexError::Io(e.to_string()))?;
             break;
         }
@@ -490,6 +521,7 @@ fn replay_offsets_wal(wal: &File) -> Result<(HashMap<String, ConsumerGroupState>
         if let Err(e) = read_exact_at(wal, &mut body, position) {
             if e.kind() == io::ErrorKind::UnexpectedEof {
                 wal.set_len(frame_start)
+                    .and_then(|_| wal.sync_data())
                     .map_err(|e| VortexError::Io(e.to_string()))?;
                 break;
             }
@@ -565,7 +597,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn test_consumer_group_cooperative_rebalance_and_fencing() {
+    fn test_consumer_group_eager_rebalance_and_fencing() {
         let dir = tempfile::tempdir().unwrap();
         let coordinator = ConsumerGroupCoordinator::new(dir.path(), Duration::from_secs(30)).unwrap();
         let group = "analytics-workers";
@@ -583,7 +615,7 @@ mod tests {
             .unwrap();
         assert_eq!(coordinator.fetch_offset(group, "clicks", 0), Some(100));
 
-        // 3. Second worker joins -> cooperative rebalance divides partitions
+        // 3. Second worker joins -> eager rebalance divides partitions
         let member2 = coordinator
             .register_or_heartbeat(group, "worker-2", None, &["clicks".into()], 2)
             .unwrap();
@@ -643,35 +675,36 @@ mod tests {
         let group = "multi-topic-group";
         let topics = vec!["orders".to_string(), "payments".to_string()];
 
-        // 1. Worker 1 registers for both topics (2 partitions each -> 4 total)
+        // Each topic is assigned only among members subscribed to that topic.
         let m1 = coordinator
-            .register_or_heartbeat(group, "worker-1", None, &topics, 2)
+            .register_or_heartbeat(group, "worker-1", None, &[topics[0].clone()], 2)
             .unwrap();
-        assert_eq!(m1.assigned_partitions.len(), 4);
+        assert_eq!(m1.assigned_partitions.len(), 2);
         assert_eq!(m1.member_epoch, 2);
 
-        // 2. Worker 2 registers -> partitions evenly divided (2 partitions each)
+        // Worker 2 subscribes to a different topic and must not receive orders.
         let m2 = coordinator
-            .register_or_heartbeat(group, "worker-2", None, &topics, 2)
+            .register_or_heartbeat(group, "worker-2", None, &[topics[1].clone()], 2)
             .unwrap();
         assert_eq!(m2.assigned_partitions.len(), 2);
         assert_eq!(m2.member_epoch, 3);
+        assert!(m2.assigned_partitions.iter().all(|(topic, _)| topic == "payments"));
 
-        // Refresh Worker 1
+        // Adding a topic to an existing member triggers a new assignment.
         let m1_refreshed = coordinator
             .register_or_heartbeat(group, "worker-1", None, &topics, 2)
             .unwrap();
-        assert_eq!(m1_refreshed.assigned_partitions.len(), 2);
-        assert_eq!(m1_refreshed.member_epoch, 3);
+        assert_eq!(m1_refreshed.assigned_partitions.len(), 3);
+        assert_eq!(m1_refreshed.member_epoch, 4);
+        assert!(m1_refreshed.assigned_partitions.iter().any(|(topic, _)| topic == "payments"));
 
-        // 3. Worker 1 leaves -> remaining Worker 2 picks up all 4 partitions
+        // Worker 1 leaves; worker 2 retains only its own topic's partitions.
         coordinator.leave_group(group, "worker-1").unwrap();
 
-        let m2_after_leave = coordinator
-            .register_or_heartbeat(group, "worker-2", None, &[], 2)
-            .unwrap();
-        assert_eq!(m2_after_leave.assigned_partitions.len(), 4);
-        assert_eq!(m2_after_leave.member_epoch, 4);
+        let (m2_epoch, m2_after_leave) = coordinator.get_member_assignment(group, "worker-2").unwrap();
+        assert_eq!(m2_after_leave.len(), 2);
+        assert_eq!(m2_epoch, 5);
+        assert!(m2_after_leave.iter().all(|(topic, _)| topic == "payments"));
 
         // 4. Stale commit from left worker is rejected
         let err = coordinator
@@ -697,9 +730,9 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(60));
 
-        // Heartbeat w-2 to keep it alive
+        // Heartbeat w-2 to keep it alive without changing its subscriptions.
         coordinator
-            .register_or_heartbeat(group, "w-2", None, &[], 2)
+            .heartbeat(group, "w-2", 3)
             .unwrap();
 
         let evicted = coordinator.evict_expired_members();
@@ -707,7 +740,7 @@ mod tests {
 
         // Surviving w-2 now owns all 2 partitions
         let w2_state = coordinator
-            .register_or_heartbeat(group, "w-2", None, &[], 2)
+            .register_or_heartbeat(group, "w-2", None, &topics, 2)
             .unwrap();
         assert_eq!(w2_state.assigned_partitions.len(), 2);
     }
@@ -753,6 +786,33 @@ mod tests {
         // Recover in a new coordinator instance from disk
         let recovered = ConsumerGroupCoordinator::new(dir.path(), Duration::from_secs(30)).unwrap();
         assert_eq!(recovered.fetch_offset(group, "topic", 0), Some(200));
+    }
+
+    #[test]
+    fn wal_compaction_failure_is_returned_before_the_new_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let coordinator = ConsumerGroupCoordinator::new(dir.path(), Duration::from_secs(30)).unwrap();
+        coordinator.set_max_wal_bytes(1);
+        let member = coordinator
+            .register_or_heartbeat("group", "member", None, &["topic".into()], 1)
+            .unwrap();
+        coordinator
+            .commit_offset("group", "member", member.member_epoch, "topic", 0, 10)
+            .unwrap();
+
+        let tmp_path = dir.path().join("consumer_offsets.wal.tmp");
+        fs::create_dir(&tmp_path).unwrap();
+        let error = coordinator
+            .commit_offset("group", "member", member.member_epoch, "topic", 0, 20)
+            .unwrap_err();
+        assert!(matches!(error, VortexError::Io(_)));
+        assert_eq!(coordinator.fetch_offset("group", "topic", 0), Some(10));
+
+        fs::remove_dir(&tmp_path).unwrap();
+        coordinator
+            .commit_offset("group", "member", member.member_epoch, "topic", 0, 20)
+            .unwrap();
+        assert_eq!(coordinator.fetch_offset("group", "topic", 0), Some(20));
     }
 
     #[test]
