@@ -26,6 +26,17 @@ impl Record {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        Self::new_with_timestamp(prev_hash, offset, key, value, timestamp)
+    }
+
+    /// Creates a record preserving a timestamp supplied by an external protocol.
+    pub fn new_with_timestamp(
+        prev_hash: HashDigest,
+        offset: u64,
+        key: Option<Bytes>,
+        value: Bytes,
+        timestamp: u64,
+    ) -> Self {
 
         let record_hash = compute_record_hash(
             &prev_hash,
@@ -112,6 +123,11 @@ impl Record {
         }
 
         let total_len = buf.get_u32() as usize;
+        if total_len < RECORD_HEADER_SIZE - 4 {
+            return Err(VortexError::InvalidRecordFormat(format!(
+                "declared payload length {total_len} is smaller than the minimum"
+            )));
+        }
         if buf.remaining() < total_len {
             return Err(VortexError::BufferUnderflow {
                 needed: total_len,
@@ -149,6 +165,17 @@ impl Record {
         reader.copy_to_slice(&mut record_hash);
 
         let key_len = reader.get_i32();
+        if key_len < -1 {
+            return Err(VortexError::InvalidRecordFormat(format!(
+                "invalid key length {key_len}"
+            )));
+        }
+        if key_len >= 0 && reader.remaining() < key_len as usize + 4 {
+            return Err(VortexError::BufferUnderflow {
+                needed: key_len as usize + 4,
+                available: reader.remaining(),
+            });
+        }
         let key = if key_len >= 0 {
             Some(reader.copy_to_bytes(key_len as usize))
         } else {
@@ -156,6 +183,12 @@ impl Record {
         };
 
         let val_len = reader.get_u32() as usize;
+        if reader.remaining() != val_len {
+            return Err(VortexError::InvalidRecordFormat(format!(
+                "value length is {val_len}, but {} bytes remain",
+                reader.remaining()
+            )));
+        }
         let value = reader.copy_to_bytes(val_len);
 
         // 3. Verify Blake3 cryptographic integrity
@@ -237,5 +270,14 @@ mod tests {
         let result = Record::decode(&mut slice);
 
         assert!(matches!(result, Err(VortexError::CorruptedRecordCrc { .. })));
+    }
+
+    #[test]
+    fn malformed_short_record_is_rejected_without_panicking() {
+        let mut bytes = BytesMut::new();
+        bytes.put_u32(4);
+        bytes.put_u32(0);
+        let mut slice = &bytes[..];
+        assert!(matches!(Record::decode(&mut slice), Err(VortexError::InvalidRecordFormat(_))));
     }
 }
