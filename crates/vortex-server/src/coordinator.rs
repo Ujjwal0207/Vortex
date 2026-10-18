@@ -236,6 +236,16 @@ impl ConsumerGroupCoordinator {
             return Err(VortexError::Io("offset WAL is in an uncertain state; restart required".into()));
         }
         let max_wal_bytes = self.max_wal_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if wal_record.len() as u64 > max_wal_bytes {
+            return Err(VortexError::SchemaValidationFailed {
+                topic: topic.to_string(),
+                reason: format!(
+                    "consumer offset record size ({} bytes) exceeds configured WAL compaction limit ({} bytes)",
+                    wal_record.len(),
+                    max_wal_bytes
+                ),
+            });
+        }
         if wal.end >= max_wal_bytes || wal.end.saturating_add(wal_record.len() as u64) > max_wal_bytes {
             // Compact the existing, already durable offsets before appending. A
             // failed compaction therefore cannot make this commit appear successful.
@@ -792,7 +802,7 @@ mod tests {
     fn wal_compaction_failure_is_returned_before_the_new_commit() {
         let dir = tempfile::tempdir().unwrap();
         let coordinator = ConsumerGroupCoordinator::new(dir.path(), Duration::from_secs(30)).unwrap();
-        coordinator.set_max_wal_bytes(1);
+        coordinator.set_max_wal_bytes(50);
         let member = coordinator
             .register_or_heartbeat("group", "member", None, &["topic".into()], 1)
             .unwrap();
@@ -813,6 +823,22 @@ mod tests {
             .commit_offset("group", "member", member.member_epoch, "topic", 0, 20)
             .unwrap();
         assert_eq!(coordinator.fetch_offset("group", "topic", 0), Some(20));
+    }
+
+    #[test]
+    fn single_oversized_wal_record_exceeding_compaction_limit_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let coordinator = ConsumerGroupCoordinator::new(dir.path(), Duration::from_secs(30)).unwrap();
+        // Set WAL compaction limit lower than the single record size (~38 bytes)
+        coordinator.set_max_wal_bytes(25);
+        let member = coordinator
+            .register_or_heartbeat("group", "member", None, &["topic".into()], 1)
+            .unwrap();
+        let error = coordinator
+            .commit_offset("group", "member", member.member_epoch, "topic", 0, 10)
+            .unwrap_err();
+        assert!(matches!(error, VortexError::SchemaValidationFailed { .. }));
+        assert_eq!(coordinator.fetch_offset("group", "topic", 0), None);
     }
 
     #[test]
