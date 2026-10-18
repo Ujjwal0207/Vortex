@@ -25,6 +25,9 @@ pub enum VortexError {
         available: usize,
     },
 
+    #[error("Invalid record format: {0}")]
+    InvalidRecordFormat(String),
+
     #[error("Invalid magic byte sequence: expected {expected:#010x}, got {actual:#010x}")]
     InvalidMagic {
         expected: u32,
