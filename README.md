@@ -56,12 +56,14 @@ Two layers. The **broker** is what `vortex-server` does on port 9092. The **CLI 
 | Unified `.vtx` (64 KB index + records) | Yes | data dir after produce |
 | Blake3 **linear** chain + CRC32 | Yes (every append + `Record::decode`) | `bench` audit, `scrub` |
 | Size cap (10 MB) + PII/secret scan → `{topic}.__quarantine` | Yes (`scan_pii` default on) | produce an `AKIA…` payload, or `pii-check` |
+| Kafka wire protocol bridge (Port 9092) | Yes (Produce, Fetch, ListOffsets, Metadata, Group APIs) | Standard Kafka client connection |
+| Consumer groups & offset WAL | Yes (member-epoch fencing, copy-on-write compacted WAL) | Connect consumer group on Port 9092 |
 | Envelope encrypt + `shred_entity` (ChaCha20-Poly1305) | Library + **CLI demo** (in-memory registry, not persisted on produce) | `shred-demo` |
 | Blind search tags | Library + **CLI** (`BlindIndexer`) — broker does not index tags yet | `blind-tag` |
 | Segment bit-rot / chain walk | **CLI** `scrub` (not a background server thread) | `scrub --data-dir` |
-| Consumer groups, replication, Kafka protocol, TLS | No | [Roadmap](#-roadmap) |
+| Clustering, replication, TLS | No | [Roadmap](#-roadmap) |
 
-Produce is **one record per TCP round-trip**. Batched linger is not in this tree.
+Atomic batch disk appends ensure multi-record batches are committed atomically without fracturing across segments.
 
 <details>
 <summary><strong>Hash chain (exact bytes hashed in <code>vortex-core</code>)</strong></summary>
@@ -479,11 +481,13 @@ Full write-up: **[BENCHMARKS.md](BENCHMARKS.md)**.
 
 | Reality in v0.1.0 | Why it matters |
 | :--- | :--- |
-| Global `Mutex` around the partition map; each log needs `&mut` for append **and** read | Concurrent produce/consume on one partition serialize |
+| Single-node event engine | Clustering and distributed replication are planned for future versions |
+| Plaintext TCP | TLS encryption is not yet enabled on the listener |
 | 64 KB sparse index (~4080 entries) | Very large segments can stop adding index points |
 | PII scan is UTF-8 text only | Avro/Protobuf/compressed blobs are not inspected |
 | Shred registry is in-memory | Broker restart forgets shredded entity IDs unless you persist keys (not built) |
-| No consumer groups / replication / TLS | Single machine; plaintext TCP |
+| Kafka API subset | Supported APIs are strictly pinned; unadvertised versions return error code 35 |
+| ReadCommitted isolation | Fails closed safely with error code 43 until transaction coordinator completes |
 
 ---
 
