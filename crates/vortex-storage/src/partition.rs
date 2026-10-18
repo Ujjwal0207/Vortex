@@ -6,7 +6,7 @@ use vortex_core::{
     compute_genesis_hash, error::Result, record::Record, HashDigest, VortexError,
 };
 
-use crate::segment::Segment;
+use crate::segment::{commit_state_path, Segment};
 
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
 
@@ -50,6 +50,7 @@ impl PartitionLog {
         } else {
             // Load existing segments in sequence
             let mut last_hash: Option<HashDigest> = None;
+            let mut expected_base_offset: Option<u64> = None;
 
             for file_path in segment_files {
                 let stem = file_path
@@ -65,6 +66,37 @@ impl PartitionLog {
 
                 let genesis = last_hash.unwrap_or_else(|| compute_genesis_hash(topic, partition_id));
                 let seg = Segment::open_or_create(&dir, base_offset, genesis)?;
+
+                // Retention may remove a prefix of the log, so the first remaining
+                // segment is the trusted chain anchor. Every following segment must
+                // continue both the offset sequence and the previous segment's hash.
+                // Segment recovery validates each file internally; these checks bind
+                // the files together and reject gaps, reordered files, or a replaced
+                // segment with an unrelated but internally valid chain.
+                if seg.base_offset != base_offset {
+                    return Err(VortexError::Io(format!(
+                        "segment filename base offset {base_offset} disagrees with header base offset {} in {:?}",
+                        seg.base_offset, file_path
+                    )));
+                }
+                if let Some(expected) = expected_base_offset {
+                    if seg.base_offset != expected {
+                        return Err(VortexError::Io(format!(
+                            "segment offset gap or overlap: expected base offset {expected}, found {} in {:?}",
+                            seg.base_offset, file_path
+                        )));
+                    }
+                }
+                if let Some(expected_genesis) = last_hash {
+                    if seg.genesis_hash != expected_genesis {
+                        return Err(VortexError::Io(format!(
+                            "segment hash-chain discontinuity at base offset {} in {:?}",
+                            seg.base_offset, file_path
+                        )));
+                    }
+                }
+
+                expected_base_offset = Some(seg.next_offset);
                 last_hash = Some(seg.last_record_hash);
                 segments.push(seg);
             }
@@ -242,13 +274,26 @@ impl PartitionLog {
             });
 
             if should_prune_size || should_prune_time {
-                let seg = self.segments.remove(0);
+                let seg = &self.segments[0];
                 let base = seg.base_offset;
-                drop(seg); // close file handle before unlink
-                let path = self.dir.join(format!("{:020}.vtx", base));
-                fs::remove_file(&path).map_err(|e| {
+                let path = seg.path.clone();
+                let commit_path = commit_state_path(&path);
+
+                // Remove the marker before the data file. If data deletion then fails,
+                // the complete legacy segment remains recoverable by scanning it.
+                remove_file_if_present(&commit_path).map_err(|e| {
+                    VortexError::Io(format!("failed to remove pruned segment commit marker {:?}: {e}", commit_path))
+                })?;
+                remove_file_if_present(&path).map_err(|e| {
                     VortexError::Io(format!("failed to remove pruned segment file {:?}: {e}", path))
                 })?;
+
+                // Keep the segment available through its open descriptor, and in
+                // memory, until unlinking has been made durable.
+                fs::File::open(&self.dir)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|e| VortexError::Io(format!("failed to sync partition directory after retention deletion: {e}")))?;
+                self.segments.remove(0);
                 pruned.push(base);
             } else {
                 break;
@@ -281,6 +326,14 @@ impl PartitionLog {
     /// Returns a mutable reference to the current active segment.
     pub fn active_segment_mut(&mut self) -> &mut Segment {
         self.segments.last_mut().expect("Partition must have at least one segment")
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -366,6 +419,75 @@ mod tests {
         let valid_records = log.read(earliest, 1024).unwrap();
         assert!(!valid_records.is_empty());
         assert_eq!(valid_records[0].offset, earliest);
+    }
+
+    #[test]
+    fn retained_segment_prefix_reopens_with_chain_continuity() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open_or_create(dir.path(), "retained", 0, 1024 * 1024).unwrap();
+
+        log.append(None, Bytes::from_static(b"oldest" )).unwrap();
+        log.roll_segment().unwrap();
+        log.append(None, Bytes::from_static(b"middle" )).unwrap();
+        log.roll_segment().unwrap();
+        log.append(None, Bytes::from_static(b"newest" )).unwrap();
+
+        let keep_bytes = log.segments[1].size() + log.segments[2].size();
+        let pruned = log.prune_retention(0, None, Some(keep_bytes)).unwrap();
+        assert_eq!(pruned, vec![0]);
+        drop(log);
+
+        let recovered = PartitionLog::open_or_create(dir.path(), "retained", 0, 1024 * 1024).unwrap();
+        assert_eq!(recovered.earliest_offset(), 1);
+        assert_eq!(recovered.next_offset(), 3);
+        assert_eq!(recovered.read(1, 4096).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn startup_rejects_disconnected_segment_hash_chain() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open_or_create(dir.path(), "disconnected", 0, 1024 * 1024).unwrap();
+        log.append(None, Bytes::from_static(b"first segment")).unwrap();
+        log.roll_segment().unwrap();
+        let segment_dir = log.dir.clone();
+        let second_segment = log.segments[1].path.clone();
+        drop(log);
+
+        fs::remove_file(&second_segment).unwrap();
+        fs::remove_file(commit_state_path(&second_segment)).unwrap();
+        let unrelated = compute_genesis_hash("unrelated", 99);
+        drop(Segment::open_or_create(&segment_dir, 1, unrelated).unwrap());
+
+        let error = match PartitionLog::open_or_create(dir.path(), "disconnected", 0, 1024 * 1024) {
+            Ok(_) => panic!("startup accepted a disconnected segment chain"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, VortexError::Io(_)));
+    }
+
+    #[test]
+    fn failed_retention_unlink_keeps_the_segment_in_memory() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open_or_create(dir.path(), "retention_error", 0, 800).unwrap();
+        for i in 0..20 {
+            log.append(None, Bytes::from(format!("payload-{i}"))).unwrap();
+        }
+        assert!(log.segments.len() > 1);
+        let original_count = log.segments.len();
+        let oldest_path = log.segments[0].path.clone();
+        let moved_path = oldest_path.with_extension("vtx.saved");
+        fs::rename(&oldest_path, &moved_path).unwrap();
+        fs::create_dir(&oldest_path).unwrap();
+
+        let error = log.prune_retention(1_000_000, None, Some(1)).unwrap_err();
+        assert!(matches!(error, VortexError::Io(_)));
+        assert_eq!(log.segments.len(), original_count);
+
+        fs::remove_dir(&oldest_path).unwrap();
+        fs::rename(&moved_path, &oldest_path).unwrap();
+        let pruned = log.prune_retention(1_000_000, None, Some(1)).unwrap();
+        assert!(!pruned.is_empty());
+        assert!(log.segments.len() < original_count);
     }
 
     #[test]
