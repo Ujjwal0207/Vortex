@@ -14,6 +14,7 @@ thiserror.workspace = true
 tokio.workspace = true
 memmap2.workspace = true
 tracing.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
