@@ -542,5 +542,32 @@ mod tests {
         };
         assert!(matches!(err, VortexError::Io(msg) if msg.contains("malformed segment filename")));
     }
+
+    #[test]
+    fn retention_crash_between_marker_removal_and_data_file_recovers() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open_or_create(dir.path(), "retention_crash", 0, 1024 * 1024).unwrap();
+        log.append(None, Bytes::from_static(b"segment 0 record")).unwrap();
+        log.roll_segment().unwrap();
+        log.append(None, Bytes::from_static(b"segment 1 record")).unwrap();
+
+        let oldest_path = log.segments[0].path.clone();
+        let commit_path = commit_state_path(&oldest_path);
+        drop(log);
+
+        // Simulate crash right after commit marker was unlinked during retention,
+        // but before the .vtx data file was unlinked
+        std::fs::remove_file(&commit_path).unwrap();
+
+        // Recovery must treat segment 0 as a legacy segment, scan it, upgrade it,
+        // and preserve offset and hash continuity across the partition
+        let recovered = PartitionLog::open_or_create(dir.path(), "retention_crash", 0, 1024 * 1024).unwrap();
+        assert_eq!(recovered.earliest_offset(), 0);
+        assert_eq!(recovered.next_offset(), 2);
+        let records = recovered.read(0, 4096).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].value.as_ref(), b"segment 0 record");
+        assert_eq!(records[1].value.as_ref(), b"segment 1 record");
+    }
 }
 
