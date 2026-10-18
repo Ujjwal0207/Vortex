@@ -886,6 +886,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "crc32fast",
  "tempfile",
  "tokio",
  "tracing",
