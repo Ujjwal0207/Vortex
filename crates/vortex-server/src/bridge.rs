@@ -17,14 +17,14 @@ impl KafkaBridge {
         (0, 5, 5),   // Produce
         (1, 5, 5),   // Fetch
         (2, 0, 5),   // ListOffsets
-        (3, 1, 1),   // Metadata
+        (3, 0, 2),   // Metadata
         (8, 2, 5),   // OffsetCommit
         (9, 2, 5),   // OffsetFetch
         (10, 0, 2),  // FindCoordinator
         (11, 0, 5),  // JoinGroup
-        (12, 0, 0),  // Heartbeat
-        (13, 0, 0),  // LeaveGroup
-        (14, 0, 0),  // SyncGroup
+        (12, 0, 3),  // Heartbeat
+        (13, 0, 2),  // LeaveGroup
+        (14, 0, 3),  // SyncGroup
         (18, 1, 1),  // ApiVersions
     ];
 
@@ -84,13 +84,13 @@ impl KafkaBridge {
             KafkaApiKey::Produce => Self::handle_produce(&mut payload, &engine).await,
             KafkaApiKey::Fetch => Self::handle_fetch(&mut payload, &engine).await,
             KafkaApiKey::ListOffsets => Self::handle_list_offsets(&mut payload, &engine, api_version).await,
-            KafkaApiKey::FindCoordinator => Self::handle_find_coordinator(&mut payload),
-            KafkaApiKey::JoinGroup => Self::handle_join_group(&mut payload, &coordinator),
-            KafkaApiKey::SyncGroup => Self::handle_sync_group(&mut payload, &coordinator),
-            KafkaApiKey::Heartbeat => Self::handle_heartbeat(&mut payload, &coordinator),
-            KafkaApiKey::LeaveGroup => Self::handle_leave_group(&mut payload, &coordinator),
-            KafkaApiKey::OffsetCommit => Self::handle_offset_commit(&mut payload, &coordinator),
-            KafkaApiKey::OffsetFetch => Self::handle_offset_fetch(&mut payload, &coordinator),
+            KafkaApiKey::FindCoordinator => Self::handle_find_coordinator(&mut payload, api_version),
+            KafkaApiKey::JoinGroup => Self::handle_join_group(&mut payload, &coordinator, api_version),
+            KafkaApiKey::SyncGroup => Self::handle_sync_group(&mut payload, &coordinator, api_version),
+            KafkaApiKey::Heartbeat => Self::handle_heartbeat(&mut payload, &coordinator, api_version),
+            KafkaApiKey::LeaveGroup => Self::handle_leave_group(&mut payload, &coordinator, api_version),
+            KafkaApiKey::OffsetCommit => Self::handle_offset_commit(&mut payload, &coordinator, api_version),
+            KafkaApiKey::OffsetFetch => Self::handle_offset_fetch(&mut payload, &coordinator, api_version),
             KafkaApiKey::InitProducerId => Self::handle_init_producer_id(),
             KafkaApiKey::Unknown(k) => {
                 warn!("Unsupported Kafka ApiKey {}; returning empty response", k);
@@ -116,7 +116,7 @@ impl KafkaBridge {
         buf.freeze()
     }
 
-    fn handle_metadata(payload: &mut Bytes, _version: i16) -> Bytes {
+    fn handle_metadata(payload: &mut Bytes, version: i16) -> Bytes {
         // Read requested topics array
         let mut requested_topics = Vec::new();
         if payload.remaining() >= 4 {
@@ -135,33 +135,45 @@ impl KafkaBridge {
         }
 
         let mut buf = BytesMut::with_capacity(256);
-        buf.put_i32(0); // ThrottleTimeMs
+        if version >= 1 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
 
         // Brokers Array: 1 broker (node 0 @ 127.0.0.1:9092)
         buf.put_i32(1); // Broker count
         buf.put_i32(0); // NodeId: 0
         KafkaCodec::put_string(&mut buf, "127.0.0.1");
         buf.put_i32(9092); // Port
-        buf.put_i16(-1);   // Rack: null
+        if version >= 1 {
+            buf.put_i16(-1); // Rack: null
+        }
 
-        // ClusterId
-        KafkaCodec::put_string(&mut buf, "vortex-cluster");
-        buf.put_i32(0); // ControllerId: 0
+        // ClusterId was introduced in Metadata v2
+        if version >= 2 {
+            KafkaCodec::put_string(&mut buf, "vortex-cluster");
+        }
+        if version >= 1 {
+            buf.put_i32(0); // ControllerId: 0
+        }
 
         // Topics Array
         buf.put_i32(requested_topics.len() as i32);
         for topic in requested_topics {
             buf.put_i16(0); // ErrorCode: NONE
             KafkaCodec::put_string(&mut buf, &topic);
-            buf.put_u8(0); // IsInternal: false
+            if version >= 1 {
+                buf.put_u8(0); // IsInternal: false
+            }
 
             // Partitions array: 1 partition (partition 0)
             buf.put_i32(1); // Partition count
             buf.put_i16(0); // ErrorCode: NONE
             buf.put_i32(0); // PartitionIndex: 0
             buf.put_i32(0); // LeaderId: 0
-            buf.put_i32(1); // LeaderEpoch: 1
-            
+            if version >= 7 {
+                buf.put_i32(1); // LeaderEpoch: 1
+            }
+
             // Replicas: [0]
             buf.put_i32(1);
             buf.put_i32(0);
@@ -170,8 +182,10 @@ impl KafkaBridge {
             buf.put_i32(1);
             buf.put_i32(0);
 
-            // OfflineReplicas: []
-            buf.put_i32(0);
+            // OfflineReplicas (v5+)
+            if version >= 5 {
+                buf.put_i32(0);
+            }
         }
 
         buf.freeze()
@@ -437,24 +451,52 @@ impl KafkaBridge {
         buf.freeze()
     }
 
-    fn handle_find_coordinator(payload: &mut Bytes) -> Bytes {
+    fn handle_find_coordinator(payload: &mut Bytes, api_version: i16) -> Bytes {
         let _key = KafkaCodec::get_string(payload).unwrap_or_default();
-        let _key_type = if payload.remaining() >= 1 { payload.get_i8() } else { 0 };
+        let key_type = if api_version >= 1 && payload.remaining() >= 1 {
+            payload.get_i8()
+        } else {
+            0
+        };
 
         let mut buf = BytesMut::with_capacity(64);
-        buf.put_i32(0); // ThrottleTimeMs
-        buf.put_i16(0); // ErrorCode: NONE
-        buf.put_i16(-1); // ErrorMessage: null
-        buf.put_i32(0); // NodeId: 0
-        KafkaCodec::put_string(&mut buf, "127.0.0.1");
-        buf.put_i32(9092); // Port: 9092
+        if api_version >= 1 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
+
+        if key_type == 1 {
+            // Transaction coordinator is unsupported in single-node mode
+            buf.put_i16(15); // COORDINATOR_NOT_AVAILABLE
+            if api_version >= 1 {
+                KafkaCodec::put_string(&mut buf, "transaction coordinator not available");
+            }
+            buf.put_i32(-1); // NodeId: -1
+            KafkaCodec::put_string(&mut buf, ""); // Host: empty
+            buf.put_i32(-1); // Port: -1
+        } else {
+            buf.put_i16(0); // ErrorCode: NONE
+            if api_version >= 1 {
+                buf.put_i16(-1); // ErrorMessage: null
+            }
+            buf.put_i32(0); // NodeId: 0
+            KafkaCodec::put_string(&mut buf, "127.0.0.1");
+            buf.put_i32(9092); // Port: 9092
+        }
         buf.freeze()
     }
 
-    fn handle_join_group(payload: &mut Bytes, coordinator: &ConsumerGroupCoordinator) -> Bytes {
+    fn handle_join_group(
+        payload: &mut Bytes,
+        coordinator: &ConsumerGroupCoordinator,
+        api_version: i16,
+    ) -> Bytes {
         let group_id = KafkaCodec::get_string(payload).unwrap_or_else(|_| "default-group".to_string());
-        let _session_timeout = if payload.remaining() >= 4 { payload.get_i32() } else { 30000 };
-        let _rebalance_timeout = if payload.remaining() >= 4 { payload.get_i32() } else { 30000 };
+        let session_timeout = if payload.remaining() >= 4 { payload.get_i32() } else { 30000 };
+        let _rebalance_timeout = if api_version >= 1 && payload.remaining() >= 4 {
+            payload.get_i32()
+        } else {
+            session_timeout
+        };
         let mut member_id = KafkaCodec::get_string(payload).unwrap_or_default();
         if member_id.is_empty() {
             member_id = format!(
@@ -465,7 +507,7 @@ impl KafkaBridge {
                     .unwrap_or(1)
             );
         }
-        let instance_id = if payload.remaining() >= 2 {
+        let instance_id = if api_version >= 5 && payload.remaining() >= 2 {
             let s = KafkaCodec::get_string(payload).ok();
             s.filter(|v| !v.is_empty())
         } else {
@@ -478,10 +520,22 @@ impl KafkaBridge {
         if payload.remaining() >= 4 {
             let proto_count = payload.get_i32();
             for _ in 0..proto_count {
-                if let Ok(p_name) = KafkaCodec::get_string(payload) {
-                    if let Ok(metadata_bytes) = KafkaCodec::get_bytes(payload) {
-                        topics.push(p_name);
-                        let _ = metadata_bytes;
+                if let Ok(_p_name) = KafkaCodec::get_string(payload) {
+                    if let Ok(Some(mut metadata_bytes)) = KafkaCodec::get_bytes(payload) {
+                        // Attempt to parse standard ConsumerProtocolSubscription: version: i16, topics: [string]
+                        if metadata_bytes.remaining() >= 6 {
+                            let _sub_version = metadata_bytes.get_i16();
+                            let topic_count = metadata_bytes.get_i32();
+                            if topic_count > 0 && topic_count <= 1000 {
+                                for _ in 0..topic_count {
+                                    if let Ok(t) = KafkaCodec::get_string(&mut metadata_bytes) {
+                                        if !t.is_empty() {
+                                            topics.push(t);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -497,7 +551,9 @@ impl KafkaBridge {
         };
 
         let mut buf = BytesMut::with_capacity(128);
-        buf.put_i32(0); // ThrottleTimeMs
+        if api_version >= 2 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
         buf.put_i16(error_code);
         buf.put_i32(generation_id);
         KafkaCodec::put_string(&mut buf, "range"); // ProtocolName
@@ -507,7 +563,9 @@ impl KafkaBridge {
         // Members array (leader receives all members)
         buf.put_i32(1); // 1 member
         KafkaCodec::put_string(&mut buf, &member_id);
-        buf.put_i16(-1); // GroupInstanceId: null
+        if api_version >= 5 {
+            buf.put_i16(-1); // GroupInstanceId: null
+        }
 
         // Member metadata (assigned partitions or subscription)
         let mut meta_buf = BytesMut::with_capacity(64);
@@ -524,61 +582,126 @@ impl KafkaBridge {
         buf.freeze()
     }
 
-    fn handle_sync_group(payload: &mut Bytes, coordinator: &ConsumerGroupCoordinator) -> Bytes {
-        let _group_id = KafkaCodec::get_string(payload).unwrap_or_default();
-        let _generation_id = if payload.remaining() >= 4 { payload.get_i32() } else { 1 };
-        let _member_id = KafkaCodec::get_string(payload).unwrap_or_default();
-        let _instance_id = if payload.remaining() >= 2 { KafkaCodec::get_string(payload).ok() } else { None };
+    fn handle_sync_group(
+        payload: &mut Bytes,
+        coordinator: &ConsumerGroupCoordinator,
+        api_version: i16,
+    ) -> Bytes {
+        let group_id = KafkaCodec::get_string(payload).unwrap_or_default();
+        let generation_id = if payload.remaining() >= 4 { payload.get_i32() } else { 1 };
+        let member_id = KafkaCodec::get_string(payload).unwrap_or_default();
+        let _instance_id = if api_version >= 3 && payload.remaining() >= 2 {
+            KafkaCodec::get_string(payload).ok()
+        } else {
+            None
+        };
 
-        let _ = coordinator;
+        // If member exists in coordinator, fetch real assigned partitions
+        let (error_code, assigned_parts) = match coordinator.get_member_assignment(&group_id, &member_id) {
+            Ok((member_epoch, parts)) => {
+                if generation_id > 0 && generation_id as u32 != member_epoch {
+                    (22i16, Vec::new()) // ILLEGAL_GENERATION
+                } else {
+                    (0i16, parts)
+                }
+            }
+            Err(_) => (25i16, Vec::new()), // UNKNOWN_MEMBER_ID
+        };
 
         let mut buf = BytesMut::with_capacity(128);
-        buf.put_i32(0); // ThrottleTimeMs
-        buf.put_i16(0); // ErrorCode: NONE
+        if api_version >= 1 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
+        buf.put_i16(error_code);
 
         // Member assignment: ConsumerProtocolAssignment version 0
-        let mut assign_buf = BytesMut::with_capacity(64);
-        assign_buf.put_i16(0); // Version 0
-        assign_buf.put_i32(1); // 1 topic
-        KafkaCodec::put_string(&mut assign_buf, "default");
-        assign_buf.put_i32(1); // 1 partition
-        assign_buf.put_i32(0); // Partition 0
-        assign_buf.put_i32(0); // UserData: null
-        KafkaCodec::put_bytes(&mut buf, &assign_buf.freeze());
+        if error_code == 0 {
+            use std::collections::BTreeMap;
+            let mut topic_map: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+            for (top, part) in assigned_parts {
+                topic_map.entry(top).or_default().push(part as i32);
+            }
+
+            let mut assign_buf = BytesMut::with_capacity(64);
+            assign_buf.put_i16(0); // Version 0
+            assign_buf.put_i32(topic_map.len() as i32);
+            for (top, mut parts) in topic_map {
+                parts.sort();
+                KafkaCodec::put_string(&mut assign_buf, &top);
+                assign_buf.put_i32(parts.len() as i32);
+                for p in parts {
+                    assign_buf.put_i32(p);
+                }
+            }
+            assign_buf.put_i32(0); // UserData: null
+            KafkaCodec::put_bytes(&mut buf, &assign_buf.freeze());
+        } else {
+            KafkaCodec::put_bytes(&mut buf, &[]);
+        }
 
         buf.freeze()
     }
 
-    fn handle_heartbeat(payload: &mut Bytes, coordinator: &ConsumerGroupCoordinator) -> Bytes {
+    fn handle_heartbeat(
+        payload: &mut Bytes,
+        coordinator: &ConsumerGroupCoordinator,
+        api_version: i16,
+    ) -> Bytes {
         let group_id = KafkaCodec::get_string(payload).unwrap_or_default();
-        let _generation_id = if payload.remaining() >= 4 { payload.get_i32() } else { 1 };
+        let generation_id = if payload.remaining() >= 4 { payload.get_i32() } else { 1 };
         let member_id = KafkaCodec::get_string(payload).unwrap_or_default();
-        let instance_id = if payload.remaining() >= 2 { KafkaCodec::get_string(payload).ok() } else { None };
+        let _instance_id = if api_version >= 3 && payload.remaining() >= 2 {
+            KafkaCodec::get_string(payload).ok()
+        } else {
+            None
+        };
 
-        let _ = coordinator.register_or_heartbeat(&group_id, &member_id, instance_id, &[], 1);
+        let error_code = match coordinator.heartbeat(&group_id, &member_id, generation_id as u32) {
+            Ok(()) => 0i16,
+            Err(VortexError::FencedMemberEpoch { .. }) => 22i16, // ILLEGAL_GENERATION
+            Err(_) => 25i16, // UNKNOWN_MEMBER_ID
+        };
 
         let mut buf = BytesMut::with_capacity(16);
-        buf.put_i32(0); // ThrottleTimeMs
-        buf.put_i16(0); // ErrorCode: NONE
+        if api_version >= 1 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
+        buf.put_i16(error_code);
         buf.freeze()
     }
 
-    fn handle_leave_group(payload: &mut Bytes, coordinator: &ConsumerGroupCoordinator) -> Bytes {
+    fn handle_leave_group(
+        payload: &mut Bytes,
+        coordinator: &ConsumerGroupCoordinator,
+        api_version: i16,
+    ) -> Bytes {
         let group_id = KafkaCodec::get_string(payload).unwrap_or_default();
         let member_id = KafkaCodec::get_string(payload).unwrap_or_default();
 
         let _ = coordinator.leave_group(&group_id, &member_id);
 
         let mut buf = BytesMut::with_capacity(16);
-        buf.put_i32(0); // ThrottleTimeMs
+        if api_version >= 1 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
         buf.put_i16(0); // ErrorCode: NONE
         buf.freeze()
     }
 
-    fn handle_offset_commit(payload: &mut Bytes, coordinator: &ConsumerGroupCoordinator) -> Bytes {
+    fn handle_offset_commit(
+        payload: &mut Bytes,
+        coordinator: &ConsumerGroupCoordinator,
+        api_version: i16,
+    ) -> Bytes {
         let group_id = KafkaCodec::get_string(payload).unwrap_or_default();
         let generation_id = if payload.remaining() >= 4 { payload.get_i32() } else { 1 };
         let member_id = KafkaCodec::get_string(payload).unwrap_or_default();
+        if api_version >= 7 && payload.remaining() >= 2 {
+            let _instance_id = KafkaCodec::get_string(payload).ok();
+        }
+        if api_version >= 2 && api_version <= 4 && payload.remaining() >= 8 {
+            let _retention_time_ms = payload.get_i64();
+        }
 
         let mut commit_results = Vec::new();
 
@@ -592,7 +715,11 @@ impl KafkaBridge {
                             if payload.remaining() >= 12 {
                                 let partition_idx = payload.get_i32() as u32;
                                 let committed_offset = payload.get_i64();
-                                let _leader_epoch = if payload.remaining() >= 4 { payload.get_i32() } else { -1 };
+                                let _leader_epoch = if api_version >= 6 && payload.remaining() >= 4 {
+                                    payload.get_i32()
+                                } else {
+                                    -1
+                                };
                                 let _metadata = KafkaCodec::get_string(payload).ok();
 
                                 let err_code = match coordinator.commit_offset(
@@ -617,7 +744,9 @@ impl KafkaBridge {
         }
 
         let mut buf = BytesMut::with_capacity(128);
-        buf.put_i32(0); // ThrottleTimeMs
+        if api_version >= 3 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
         buf.put_i32(commit_results.len() as i32);
         for (top, part, err) in commit_results {
             KafkaCodec::put_string(&mut buf, &top);
@@ -628,7 +757,11 @@ impl KafkaBridge {
         buf.freeze()
     }
 
-    fn handle_offset_fetch(payload: &mut Bytes, coordinator: &ConsumerGroupCoordinator) -> Bytes {
+    fn handle_offset_fetch(
+        payload: &mut Bytes,
+        coordinator: &ConsumerGroupCoordinator,
+        api_version: i16,
+    ) -> Bytes {
         let group_id = KafkaCodec::get_string(payload).unwrap_or_default();
         let mut fetch_results = Vec::new();
 
@@ -653,18 +786,24 @@ impl KafkaBridge {
         }
 
         let mut buf = BytesMut::with_capacity(128);
-        buf.put_i32(0); // ThrottleTimeMs
+        if api_version >= 3 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
         buf.put_i32(fetch_results.len() as i32);
         for (top, part, offset) in fetch_results {
             KafkaCodec::put_string(&mut buf, &top);
             buf.put_i32(1); // 1 partition
             buf.put_i32(part as i32);
             buf.put_i64(offset);
-            buf.put_i32(1); // LeaderEpoch
+            if api_version >= 5 {
+                buf.put_i32(1); // LeaderEpoch
+            }
             buf.put_i16(-1); // Metadata: null
             buf.put_i16(0); // ErrorCode: NONE
         }
-        buf.put_i16(0); // Top-level ErrorCode: NONE
+        if api_version >= 2 {
+            buf.put_i16(0); // Top-level ErrorCode: NONE
+        }
         buf.freeze()
     }
 
@@ -1194,7 +1333,147 @@ mod tests {
         let _size = r.get_i32();
         assert_eq!(r.get_i32(), 999); // Matching correlation ID
         assert_eq!(r.get_i16(), 0);   // ErrorCode: NONE
-        assert_eq!(r.get_i32(), 12);  // Only APIs currently exposed by the bridge.
+        assert_eq!(r.get_i32(), 12);  // 12 exposed APIs in the matrix.
+
+        // 2. Metadata Request v1 (Checks no cluster_id shift corruption)
+        let mut meta_req = BytesMut::new();
+        meta_req.put_i16(3); // Metadata
+        meta_req.put_i16(1); // v1
+        meta_req.put_i32(1001);
+        KafkaCodec::put_string(&mut meta_req, "client-app");
+        meta_req.put_i32(1); // 1 topic
+        KafkaCodec::put_string(&mut meta_req, "sensor-data");
+
+        let total_size = meta_req.len() as i32;
+        let mut frame_buf = BytesMut::new();
+        frame_buf.put_i32(total_size);
+        frame_buf.put_slice(&meta_req);
+
+        let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
+        let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
+
+        let mut r = &resp[..];
+        let _size = r.get_i32();
+        assert_eq!(r.get_i32(), 1001);
+        let _throttle = r.get_i32(); // ThrottleTimeMs
+        let broker_count = r.get_i32();
+        assert_eq!(broker_count, 1);
+        let node_id = r.get_i32();
+        assert_eq!(node_id, 0);
+        let host = KafkaCodec::get_string(&mut r).unwrap();
+        assert_eq!(host, "127.0.0.1");
+        let port = r.get_i32();
+        assert_eq!(port, 9092);
+        let rack = r.get_i16();
+        assert_eq!(rack, -1); // null
+        let controller_id = r.get_i32();
+        assert_eq!(controller_id, 0); // Must be 0, NOT corrupted by cluster_id string!
+        let topic_count = r.get_i32();
+        assert_eq!(topic_count, 1);
+        let topic_err = r.get_i16();
+        assert_eq!(topic_err, 0);
+        let topic_name = KafkaCodec::get_string(&mut r).unwrap();
+        assert_eq!(topic_name, "sensor-data");
+        let is_internal = r.get_u8();
+        assert_eq!(is_internal, 0);
+        let partition_count = r.get_i32();
+        assert_eq!(partition_count, 1);
+        let part_err = r.get_i16();
+        assert_eq!(part_err, 0);
+        let part_idx = r.get_i32();
+        assert_eq!(part_idx, 0);
+        let leader_id = r.get_i32();
+        assert_eq!(leader_id, 0);
+        let replica_count = r.get_i32();
+        assert_eq!(replica_count, 1);
+        let replica = r.get_i32();
+        assert_eq!(replica, 0);
+        let isr_count = r.get_i32();
+        assert_eq!(isr_count, 1);
+        let isr = r.get_i32();
+        assert_eq!(isr, 0);
+
+        // 3. Metadata Request v2 (Checks cluster_id presence)
+        let mut meta_req2 = BytesMut::new();
+        meta_req2.put_i16(3); // Metadata
+        meta_req2.put_i16(2); // v2
+        meta_req2.put_i32(1002);
+        KafkaCodec::put_string(&mut meta_req2, "client-app");
+        meta_req2.put_i32(0); // empty topics -> default
+
+        let total_size = meta_req2.len() as i32;
+        let mut frame_buf = BytesMut::new();
+        frame_buf.put_i32(total_size);
+        frame_buf.put_slice(&meta_req2);
+
+        let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
+        let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
+
+        let mut r = &resp[..];
+        let _size = r.get_i32();
+        assert_eq!(r.get_i32(), 1002);
+        let _throttle = r.get_i32();
+        let _brokers = r.get_i32();
+        let _node = r.get_i32();
+        let _ = KafkaCodec::get_string(&mut r).unwrap();
+        let _port = r.get_i32();
+        let _rack = r.get_i16();
+        let cluster_id = KafkaCodec::get_string(&mut r).unwrap();
+        assert_eq!(cluster_id, "vortex-cluster");
+        let controller_id = r.get_i32();
+        assert_eq!(controller_id, 0);
+
+        // 4. FindCoordinator v0 (Consumer Group coordinator)
+        let mut find_req = BytesMut::new();
+        find_req.put_i16(10); // FindCoordinator
+        find_req.put_i16(0);  // v0
+        find_req.put_i32(1003);
+        KafkaCodec::put_string(&mut find_req, "client-app");
+        KafkaCodec::put_string(&mut find_req, "analytics-group");
+
+        let total_size = find_req.len() as i32;
+        let mut frame_buf = BytesMut::new();
+        frame_buf.put_i32(total_size);
+        frame_buf.put_slice(&find_req);
+
+        let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
+        let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
+
+        let mut r = &resp[..];
+        let _size = r.get_i32();
+        assert_eq!(r.get_i32(), 1003);
+        let err = r.get_i16(); // In v0, first field is error_code!
+        assert_eq!(err, 0);
+        let node_id = r.get_i32();
+        assert_eq!(node_id, 0);
+        let host = KafkaCodec::get_string(&mut r).unwrap();
+        assert_eq!(host, "127.0.0.1");
+        let port = r.get_i32();
+        assert_eq!(port, 9092);
+
+        // 5. FindCoordinator v2 (Transaction Coordinator rejected safely)
+        let mut find_txn_req = BytesMut::new();
+        find_txn_req.put_i16(10); // FindCoordinator
+        find_txn_req.put_i16(2);  // v2
+        find_txn_req.put_i32(1004);
+        KafkaCodec::put_string(&mut find_txn_req, "client-app");
+        KafkaCodec::put_string(&mut find_txn_req, "my-txn-id");
+        find_txn_req.put_i8(1); // key_type = 1 (Transaction)
+
+        let total_size = find_txn_req.len() as i32;
+        let mut frame_buf = BytesMut::new();
+        frame_buf.put_i32(total_size);
+        frame_buf.put_slice(&find_txn_req);
+
+        let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
+        let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
+
+        let mut r = &resp[..];
+        let _size = r.get_i32();
+        assert_eq!(r.get_i32(), 1004);
+        let _throttle = r.get_i32();
+        let err = r.get_i16();
+        assert_eq!(err, 15); // COORDINATOR_NOT_AVAILABLE
     }
 
     #[tokio::test]
@@ -1206,7 +1485,7 @@ mod tests {
         let group_id = "test-group";
         let topic = "test-topic";
 
-        // 1. JoinGroup (ApiKey 11)
+        // 1. JoinGroup (ApiKey 11, v5)
         let mut join_req = BytesMut::new();
         join_req.put_i16(11); // JoinGroup
         join_req.put_i16(5);  // v5
@@ -1216,10 +1495,17 @@ mod tests {
         join_req.put_i32(30000); // SessionTimeout
         join_req.put_i32(30000); // RebalanceTimeout
         KafkaCodec::put_string(&mut join_req, "member-1");
+        join_req.put_i16(-1); // GroupInstanceId: null
         KafkaCodec::put_string(&mut join_req, "consumer"); // ProtocolType
+        let mut sub_buf = BytesMut::new();
+        sub_buf.put_i16(0); // Version 0
+        sub_buf.put_i32(1); // 1 topic
+        KafkaCodec::put_string(&mut sub_buf, topic);
+        sub_buf.put_i32(0); // UserData: null
+
         join_req.put_i32(1); // 1 protocol
         KafkaCodec::put_string(&mut join_req, "range");
-        KafkaCodec::put_bytes(&mut join_req, b"metadata");
+        KafkaCodec::put_bytes(&mut join_req, &sub_buf.freeze());
 
         let total_size = join_req.len() as i32;
         let mut frame_buf = BytesMut::new();
@@ -1237,21 +1523,104 @@ mod tests {
         let generation_id = r.get_i32();
         assert_eq!(generation_id, 2); // Initial group epoch starts at 1, rebalances to 2
 
-        // 2. OffsetCommit (ApiKey 8)
+        // 2. SyncGroup (ApiKey 14, v0)
+        let mut sync_req = BytesMut::new();
+        sync_req.put_i16(14); // SyncGroup
+        sync_req.put_i16(0);  // v0
+        sync_req.put_i32(2002);
+        KafkaCodec::put_string(&mut sync_req, "client-app");
+        KafkaCodec::put_string(&mut sync_req, group_id);
+        sync_req.put_i32(generation_id);
+        KafkaCodec::put_string(&mut sync_req, "member-1");
+        sync_req.put_i32(0); // 0 group assignments
+
+        let total_size = sync_req.len() as i32;
+        let mut frame_buf = BytesMut::new();
+        frame_buf.put_i32(total_size);
+        frame_buf.put_slice(&sync_req);
+
+        let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
+        let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
+
+        let mut r = &resp[..];
+        let _size = r.get_i32();
+        assert_eq!(r.get_i32(), 2002);
+        let sync_err = r.get_i16();
+        assert_eq!(sync_err, 0); // Sync succeeded
+        let mut assign_bytes = KafkaCodec::get_bytes(&mut r).unwrap().unwrap();
+        assert!(assign_bytes.len() >= 6);
+        let assign_ver = assign_bytes.get_i16();
+        assert_eq!(assign_ver, 0);
+        let assigned_topic_count = assign_bytes.get_i32();
+        assert_eq!(assigned_topic_count, 1);
+        let assigned_top = KafkaCodec::get_string(&mut assign_bytes).unwrap();
+        assert_eq!(assigned_top, "test-topic");
+
+        // 3. Heartbeat (ApiKey 12, v0) - Valid epoch
+        let mut hb_req = BytesMut::new();
+        hb_req.put_i16(12); // Heartbeat
+        hb_req.put_i16(0);  // v0
+        hb_req.put_i32(2003);
+        KafkaCodec::put_string(&mut hb_req, "client-app");
+        KafkaCodec::put_string(&mut hb_req, group_id);
+        hb_req.put_i32(generation_id);
+        KafkaCodec::put_string(&mut hb_req, "member-1");
+
+        let total_size = hb_req.len() as i32;
+        let mut frame_buf = BytesMut::new();
+        frame_buf.put_i32(total_size);
+        frame_buf.put_slice(&hb_req);
+
+        let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
+        let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
+
+        let mut r = &resp[..];
+        let _size = r.get_i32();
+        assert_eq!(r.get_i32(), 2003);
+        let hb_err = r.get_i16();
+        assert_eq!(hb_err, 0);
+
+        // 4. Heartbeat (ApiKey 12, v0) - Stale epoch 1 rejected
+        let mut stale_hb_req = BytesMut::new();
+        stale_hb_req.put_i16(12);
+        stale_hb_req.put_i16(0);
+        stale_hb_req.put_i32(2004);
+        KafkaCodec::put_string(&mut stale_hb_req, "client-app");
+        KafkaCodec::put_string(&mut stale_hb_req, group_id);
+        stale_hb_req.put_i32(1); // Stale generation
+        KafkaCodec::put_string(&mut stale_hb_req, "member-1");
+
+        let total_size = stale_hb_req.len() as i32;
+        let mut frame_buf = BytesMut::new();
+        frame_buf.put_i32(total_size);
+        frame_buf.put_slice(&stale_hb_req);
+
+        let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
+        let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
+
+        let mut r = &resp[..];
+        let _size = r.get_i32();
+        assert_eq!(r.get_i32(), 2004);
+        let stale_err = r.get_i16();
+        assert_eq!(stale_err, 22); // ILLEGAL_GENERATION
+
+        // 5. OffsetCommit v2 (with retention_time_ms)
         let mut commit_req = BytesMut::new();
         commit_req.put_i16(8); // OffsetCommit
-        commit_req.put_i16(5); // v5
-        commit_req.put_i32(2002);
+        commit_req.put_i16(2); // v2
+        commit_req.put_i32(2005);
         KafkaCodec::put_string(&mut commit_req, "client-app");
         KafkaCodec::put_string(&mut commit_req, group_id);
         commit_req.put_i32(generation_id); // generation_id
         KafkaCodec::put_string(&mut commit_req, "member-1");
+        commit_req.put_i64(-1); // retention_time_ms: -1
 
         commit_req.put_i32(1); // 1 topic
         KafkaCodec::put_string(&mut commit_req, topic);
         commit_req.put_i32(1); // 1 partition
         commit_req.put_i32(0); // partition 0
         commit_req.put_i64(42); // committed offset 42
+        KafkaCodec::put_string(&mut commit_req, "meta");
 
         let total_size = commit_req.len() as i32;
         let mut frame_buf = BytesMut::new();
@@ -1263,8 +1632,8 @@ mod tests {
 
         let mut r = &resp[..];
         let _size = r.get_i32();
-        assert_eq!(r.get_i32(), 2002);
-        let _throttle = r.get_i32();
+        assert_eq!(r.get_i32(), 2005);
+        // In v2, no throttle_time_ms! First field is topic_count!
         let topic_count = r.get_i32();
         assert_eq!(topic_count, 1);
         let committed_top = KafkaCodec::get_string(&mut r).unwrap();
@@ -1276,11 +1645,11 @@ mod tests {
         let commit_err = r.get_i16();
         assert_eq!(commit_err, 0); // Commit succeeded!
 
-        // 3. OffsetFetch (ApiKey 9)
+        // 6. OffsetFetch v2 (ApiKey 9)
         let mut fetch_off_req = BytesMut::new();
         fetch_off_req.put_i16(9); // OffsetFetch
-        fetch_off_req.put_i16(5); // v5
-        fetch_off_req.put_i32(2003);
+        fetch_off_req.put_i16(2); // v2
+        fetch_off_req.put_i32(2006);
         KafkaCodec::put_string(&mut fetch_off_req, "client-app");
         KafkaCodec::put_string(&mut fetch_off_req, group_id);
         fetch_off_req.put_i32(1); // 1 topic
@@ -1298,8 +1667,8 @@ mod tests {
 
         let mut r = &resp[..];
         let _size = r.get_i32();
-        assert_eq!(r.get_i32(), 2003);
-        let _throttle = r.get_i32();
+        assert_eq!(r.get_i32(), 2006);
+        // In v2, no throttle_time_ms! First field is topic_count!
         let fetch_top_count = r.get_i32();
         assert_eq!(fetch_top_count, 1);
         let _ = KafkaCodec::get_string(&mut r).unwrap();
@@ -1307,6 +1676,29 @@ mod tests {
         let _ = r.get_i32();
         let retrieved_offset = r.get_i64();
         assert_eq!(retrieved_offset, 42); // Offset verified!
+
+        // 7. LeaveGroup (ApiKey 13, v0)
+        let mut leave_req = BytesMut::new();
+        leave_req.put_i16(13); // LeaveGroup
+        leave_req.put_i16(0);  // v0
+        leave_req.put_i32(2007);
+        KafkaCodec::put_string(&mut leave_req, "client-app");
+        KafkaCodec::put_string(&mut leave_req, group_id);
+        KafkaCodec::put_string(&mut leave_req, "member-1");
+
+        let total_size = leave_req.len() as i32;
+        let mut frame_buf = BytesMut::new();
+        frame_buf.put_i32(total_size);
+        frame_buf.put_slice(&leave_req);
+
+        let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
+        let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
+
+        let mut r = &resp[..];
+        let _size = r.get_i32();
+        assert_eq!(r.get_i32(), 2007);
+        let leave_err = r.get_i16();
+        assert_eq!(leave_err, 0);
     }
 
     #[tokio::test]

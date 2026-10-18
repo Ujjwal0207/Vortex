@@ -346,6 +346,62 @@ impl ConsumerGroupCoordinator {
         evicted
     }
 
+    /// Retrieves current assigned partitions and member epoch for an active member.
+    pub fn get_member_assignment(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<(u32, Vec<(String, u32)>)> {
+        let groups = self.groups.read().unwrap();
+        let group = groups.get(group_id).ok_or_else(|| {
+            VortexError::SecurityViolation {
+                reason: format!("Unknown consumer group '{group_id}'"),
+            }
+        })?;
+        let member = group.members.get(member_id).ok_or_else(|| {
+            VortexError::SecurityViolation {
+                reason: format!("Unknown consumer member '{member_id}' in group '{group_id}'"),
+            }
+        })?;
+        if member.heartbeat_expiry <= Instant::now() {
+            return Err(VortexError::SecurityViolation {
+                reason: format!("Expired consumer member '{member_id}' in group '{group_id}'"),
+            });
+        }
+        Ok((member.member_epoch, member.assigned_partitions.clone()))
+    }
+
+    /// Records a heartbeat for an existing member without triggering rebalancing.
+    /// Validates member existence and member epoch.
+    pub fn heartbeat(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member_epoch: u32,
+    ) -> Result<()> {
+        let mut groups = self.groups.write().unwrap();
+        let group = groups.get_mut(group_id).ok_or_else(|| {
+            VortexError::SecurityViolation {
+                reason: format!("Unknown consumer group '{group_id}'"),
+            }
+        })?;
+        let member = group.members.get_mut(member_id).ok_or_else(|| {
+            VortexError::SecurityViolation {
+                reason: format!("Unknown consumer member '{member_id}' in group '{group_id}'"),
+            }
+        })?;
+        if member_epoch > 0 && member_epoch != member.member_epoch {
+            return Err(VortexError::FencedMemberEpoch {
+                group_id: group_id.to_string(),
+                member_id: member_id.to_string(),
+                current: member.member_epoch,
+                attempted: member_epoch,
+            });
+        }
+        member.heartbeat_expiry = Instant::now() + self.heartbeat_timeout;
+        Ok(())
+    }
+
     /// Explicitly removes a member from the consumer group upon client shutdown.
     /// Rebalances remaining members and increments group_epoch for member-epoch fencing.
     pub fn leave_group(&self, group_id: &str, member_id: &str) -> Result<()> {
@@ -697,5 +753,35 @@ mod tests {
         // Recover in a new coordinator instance from disk
         let recovered = ConsumerGroupCoordinator::new(dir.path(), Duration::from_secs(30)).unwrap();
         assert_eq!(recovered.fetch_offset(group, "topic", 0), Some(200));
+    }
+
+    #[test]
+    fn test_coordinator_member_assignment_and_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let coordinator =
+            ConsumerGroupCoordinator::new(dir.path(), Duration::from_secs(30)).unwrap();
+        let group = "assignment-group";
+        let topics = vec!["orders".to_string(), "users".to_string()];
+
+        let reg = coordinator
+            .register_or_heartbeat(group, "w-1", None, &topics, 2)
+            .unwrap();
+        assert_eq!(reg.member_epoch, 2);
+
+        // Fetch assignments directly
+        let (epoch, parts) = coordinator.get_member_assignment(group, "w-1").unwrap();
+        assert_eq!(epoch, 2);
+        assert_eq!(parts.len(), 4); // 2 partitions for orders, 2 for users
+
+        // Valid heartbeat
+        assert!(coordinator.heartbeat(group, "w-1", 2).is_ok());
+
+        // Fenced heartbeat with stale epoch
+        let stale_res = coordinator.heartbeat(group, "w-1", 1);
+        assert!(matches!(stale_res, Err(VortexError::FencedMemberEpoch { .. })));
+
+        // Unknown member heartbeat
+        let unknown_res = coordinator.heartbeat(group, "ghost", 2);
+        assert!(matches!(unknown_res, Err(VortexError::SecurityViolation { .. })));
     }
 }

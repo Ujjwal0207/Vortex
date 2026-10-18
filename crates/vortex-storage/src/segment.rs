@@ -176,8 +176,26 @@ impl Segment {
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
             let mut slice = &record_raw[..];
-            let rec = Record::decode(&mut slice)?;
+            let rec = match Record::decode(&mut slice) {
+                Ok(rec) => rec,
+                Err(_e) if record_end == file_len => {
+                    // Torn write at segment tail (e.g. power-loss crash mid-append).
+                    // Safely truncate to the last valid record boundary.
+                    file.set_len(curr_pos)
+                        .map_err(|io_err| VortexError::Io(io_err.to_string()))?;
+                    let _ = file.sync_data();
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
             if rec.offset != next_offset || rec.prev_hash != last_hash {
+                if record_end == file_len {
+                    // Torn lineage at the tail from partial write
+                    file.set_len(curr_pos)
+                        .map_err(|io_err| VortexError::Io(io_err.to_string()))?;
+                    let _ = file.sync_data();
+                    break;
+                }
                 return Err(VortexError::CryptographicLineageBroken {
                     offset: rec.offset,
                     expected: format!("{} at offset {}", hex_hash(&last_hash), next_offset),
@@ -492,5 +510,40 @@ mod tests {
         let mut stored_count = [0u8; 4];
         recovered.file.read_exact_at(&mut stored_count, 252).unwrap();
         assert_eq!(u32::from_be_bytes(stored_count), 1);
+    }
+
+    #[test]
+    fn test_segment_torn_tail_write_recovery() {
+        let dir = tempdir().unwrap();
+        let genesis = compute_genesis_hash("torn-test", 0);
+
+        let mut seg = Segment::open_or_create(dir.path(), 0, genesis).expect("Segment created");
+        for i in 0..5 {
+            let val = Bytes::from(format!("record-{i}"));
+            seg.append(None, val).unwrap();
+        }
+        seg.flush().unwrap();
+        assert_eq!(seg.next_offset, 5);
+        let valid_size = seg.size();
+
+        // Simulate a power-loss torn write at the tail by appending garbage bytes
+        let mut torn_data = vec![0u8; 120];
+        // Total len declared as 116 bytes
+        torn_data[0..4].copy_from_slice(&116u32.to_be_bytes());
+        // Deliberately wrong CRC / corrupted body
+        torn_data[4..8].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+        seg.file.write_all_at(&torn_data, valid_size).unwrap();
+        drop(seg);
+
+        // Reopen segment: recovery must detect torn tail write, truncate it to valid_size,
+        // and resume cleanly at next_offset = 5
+        let mut recovered = Segment::open_or_create(dir.path(), 0, genesis).expect("Recovery must succeed");
+        assert_eq!(recovered.next_offset, 5);
+        assert_eq!(recovered.size(), valid_size);
+
+        // Can append record 5 without issue
+        let new_rec = recovered.append(None, Bytes::from_static(b"record-5-after-crash")).unwrap();
+        assert_eq!(new_rec.offset, 5);
+        assert_eq!(recovered.next_offset, 6);
     }
 }
