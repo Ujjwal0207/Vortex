@@ -1896,5 +1896,281 @@ mod tests {
         let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
         assert!(resp.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_all_advertised_api_versions_conform_to_schema_and_pass() {
+        let tmp = tempdir().unwrap();
+        let engine = Arc::new(Engine::new(tmp.path().to_path_buf()));
+        let coordinator = Arc::new(ConsumerGroupCoordinator::new(tmp.path(), std::time::Duration::from_secs(30)).unwrap());
+
+        async fn send_req(
+            engine: &Arc<Engine>,
+            coordinator: &Arc<ConsumerGroupCoordinator>,
+            api_key: i16,
+            version: i16,
+            corr_id: i32,
+            payload: &[u8],
+        ) -> Bytes {
+            let mut req = BytesMut::new();
+            req.put_i16(api_key);
+            req.put_i16(version);
+            req.put_i32(corr_id);
+            KafkaCodec::put_string(&mut req, "compat-test-client");
+            if KafkaFrame::uses_flexible_header(api_key, version) {
+                req.put_u8(0); // Empty request-header TAG_BUFFER
+            }
+            req.put_slice(payload);
+
+            let total_size = req.len() as i32;
+            let mut frame_buf = BytesMut::new();
+            frame_buf.put_i32(total_size);
+            frame_buf.put_slice(&req);
+
+            let frame = KafkaFrame::decode(&mut frame_buf).unwrap().expect("frame decoded");
+            KafkaBridge::handle_frame(frame, Arc::clone(engine), Arc::clone(coordinator)).await
+        }
+
+        let mut corr_id = 5000;
+
+        // 1. ApiVersions: v1
+        {
+            corr_id += 1;
+            let resp = send_req(&engine, &coordinator, 18, 1, corr_id, &[]).await;
+            assert!(!resp.is_empty());
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+            assert_eq!(r.get_i16(), 0); // ErrorCode: NONE
+        }
+
+        // 2. Metadata: v0..=2
+        for v in 0..=2 {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            payload.put_i32(1); // 1 topic
+            KafkaCodec::put_string(&mut payload, "test-topic");
+            let resp = send_req(&engine, &coordinator, 3, v, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "Metadata v{v} failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+
+        // 3. FindCoordinator: v0..=2
+        for v in 0..=2 {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            KafkaCodec::put_string(&mut payload, "compat-group");
+            if v >= 1 {
+                payload.put_i8(0); // KeyType: GROUP
+            }
+            let resp = send_req(&engine, &coordinator, 10, v, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "FindCoordinator v{v} failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+
+        // 4. JoinGroup: v0..=5
+        let mut member_id = String::new();
+        for v in 0..=5 {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            KafkaCodec::put_string(&mut payload, "compat-group");
+            payload.put_i32(30000); // session_timeout
+            if v >= 1 {
+                payload.put_i32(30000); // rebalance_timeout
+            }
+            KafkaCodec::put_string(&mut payload, &member_id);
+            if v >= 5 {
+                payload.put_i16(-1); // instance_id: null
+            }
+            KafkaCodec::put_string(&mut payload, "consumer");
+            payload.put_i32(1); // 1 protocol
+            KafkaCodec::put_string(&mut payload, "range");
+            let mut meta = BytesMut::new();
+            meta.put_i16(0); // version 0
+            meta.put_i32(1); // 1 topic
+            KafkaCodec::put_string(&mut meta, "test-topic");
+            KafkaCodec::put_bytes(&mut payload, &meta.freeze());
+
+            let resp = send_req(&engine, &coordinator, 11, v, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "JoinGroup v{v} failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+            if v >= 2 {
+                let _throttle = r.get_i32();
+            }
+            assert_eq!(r.get_i16(), 0); // ErrorCode: NONE
+            let _gen = r.get_i32();
+            let _proto = KafkaCodec::get_string(&mut r).unwrap();
+            let _leader = KafkaCodec::get_string(&mut r).unwrap();
+            member_id = KafkaCodec::get_string(&mut r).unwrap();
+        }
+
+        // 5. SyncGroup: v0..=3
+        for v in 0..=3 {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            KafkaCodec::put_string(&mut payload, "compat-group");
+            payload.put_i32(1); // generation_id
+            KafkaCodec::put_string(&mut payload, &member_id);
+            if v >= 3 {
+                payload.put_i16(-1); // instance_id: null
+            }
+            payload.put_i32(0); // assignments count
+            let resp = send_req(&engine, &coordinator, 14, v, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "SyncGroup v{v} failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+
+        // 6. Heartbeat: v0..=3
+        for v in 0..=3 {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            KafkaCodec::put_string(&mut payload, "compat-group");
+            payload.put_i32(1); // generation_id
+            KafkaCodec::put_string(&mut payload, &member_id);
+            if v >= 3 {
+                payload.put_i16(-1); // instance_id: null
+            }
+            let resp = send_req(&engine, &coordinator, 12, v, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "Heartbeat v{v} failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+
+        // 7. OffsetCommit: v2..=5
+        for v in 2..=5 {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            KafkaCodec::put_string(&mut payload, "compat-group");
+            payload.put_i32(1); // generation_id
+            KafkaCodec::put_string(&mut payload, &member_id);
+            if v >= 2 && v <= 4 {
+                payload.put_i64(-1); // retention_time_ms
+            }
+            payload.put_i32(1); // 1 topic
+            KafkaCodec::put_string(&mut payload, "test-topic");
+            payload.put_i32(1); // 1 partition
+            payload.put_i32(0); // partition 0
+            payload.put_i64(100 + v as i64); // offset
+            payload.put_i16(-1); // metadata: null
+
+            let resp = send_req(&engine, &coordinator, 8, v, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "OffsetCommit v{v} failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+
+        // 8. OffsetFetch: v2..=5
+        for v in 2..=5 {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            KafkaCodec::put_string(&mut payload, "compat-group");
+            payload.put_i32(1); // 1 topic
+            KafkaCodec::put_string(&mut payload, "test-topic");
+            payload.put_i32(1); // 1 partition
+            payload.put_i32(0); // partition 0
+
+            let resp = send_req(&engine, &coordinator, 9, v, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "OffsetFetch v{v} failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+
+        // 9. ListOffsets: v0..=5
+        for v in 0..=5 {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            payload.put_i32(-1); // replica_id
+            if v >= 2 {
+                payload.put_i8(0); // isolation
+            }
+            payload.put_i32(1); // 1 topic
+            KafkaCodec::put_string(&mut payload, "test-topic");
+            payload.put_i32(1); // 1 partition
+            payload.put_i32(0); // partition 0
+            if v >= 4 {
+                payload.put_i32(0); // current_leader_epoch
+            }
+            payload.put_i64(-1); // timestamp: latest
+            if v == 0 {
+                payload.put_i32(1); // max_num_offsets
+            }
+
+            let resp = send_req(&engine, &coordinator, 2, v, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "ListOffsets v{v} failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+
+        // 10. Produce: v5
+        {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            payload.put_i16(-1); // tx_id: null
+            payload.put_i16(1);  // acks: 1
+            payload.put_i32(1500); // timeout_ms
+            payload.put_i32(1);  // 1 topic
+            KafkaCodec::put_string(&mut payload, "test-topic");
+            payload.put_i32(1);  // 1 partition
+            payload.put_i32(0);  // partition 0
+            let record = Record::new([0u8; 32], 0, None, Bytes::from_static(b"produce-v5-payload"));
+            let batch = KafkaBridge::encode_record_batch(&[record]);
+            KafkaCodec::put_bytes(&mut payload, &batch);
+
+            let resp = send_req(&engine, &coordinator, 0, 5, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "Produce v5 failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+
+        // 11. Fetch: v5
+        {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            payload.put_i32(-1); // replica_id
+            payload.put_i32(500); // max_wait_ms
+            payload.put_i32(1);  // min_bytes
+            payload.put_i32(1048576); // max_bytes
+            payload.put_i8(0);   // isolation_level
+            payload.put_i32(1);  // 1 topic
+            KafkaCodec::put_string(&mut payload, "test-topic");
+            payload.put_i32(1);  // 1 partition
+            payload.put_i32(0);  // partition 0
+            payload.put_i64(0);  // fetch_offset
+            payload.put_i64(0);  // log_start_offset
+            payload.put_i32(1048576); // max_bytes
+
+            let resp = send_req(&engine, &coordinator, 1, 5, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "Fetch v5 failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+
+        // 12. LeaveGroup: v0..=2
+        for v in 0..=2 {
+            corr_id += 1;
+            let mut payload = BytesMut::new();
+            KafkaCodec::put_string(&mut payload, "compat-group");
+            KafkaCodec::put_string(&mut payload, &member_id);
+
+            let resp = send_req(&engine, &coordinator, 13, v, corr_id, &payload).await;
+            assert!(!resp.is_empty(), "LeaveGroup v{v} failed");
+            let mut r = &resp[..];
+            assert!(r.get_i32() > 0);
+            assert_eq!(r.get_i32(), corr_id);
+        }
+    }
 }
 
