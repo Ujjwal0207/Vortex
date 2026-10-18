@@ -736,4 +736,96 @@ mod tests {
         assert_eq!(recovered.next_offset, 1);
         assert!(commit_state_path(&segment_path).exists());
     }
+
+    #[test]
+    fn marker_publish_failure_poisons_segment_and_recovers_to_previous_commit() {
+        let dir = tempdir().unwrap();
+        let genesis = compute_genesis_hash("poison-test", 0);
+        let mut seg = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
+        seg.append(None, Bytes::from_static(b"committed-batch-1")).unwrap();
+        let valid_size = seg.size();
+        let valid_offset = seg.next_offset;
+
+        // Block commit publication by creating a directory where .commit.tmp would be written
+        let commit_tmp = seg.commit_path.with_file_name(format!(
+            "{}.tmp",
+            seg.commit_path.file_name().unwrap().to_str().unwrap()
+        ));
+        std::fs::create_dir(&commit_tmp).unwrap();
+
+        // Attempting to append must fail and poison the segment
+        let err = seg.append(None, Bytes::from_static(b"uncommitted-batch-2")).unwrap_err();
+        assert!(matches!(err, VortexError::Io(_)));
+
+        // Subsequent append must fail immediately due to poisoning
+        let err2 = seg.append(None, Bytes::from_static(b"uncommitted-batch-3")).unwrap_err();
+        assert!(matches!(err2, VortexError::Io(_)));
+        assert!(err2.to_string().contains("poisoned"));
+
+        // Clean up blocking directory and restart
+        std::fs::remove_dir(&commit_tmp).unwrap();
+        drop(seg);
+
+        // Reopening the segment must recover to the last valid commit
+        let recovered = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
+        assert_eq!(recovered.next_offset, valid_offset);
+        assert_eq!(recovered.size(), valid_size);
+        let records = recovered.read(0, 1024).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].value.as_ref(), b"committed-batch-1");
+    }
+
+    #[test]
+    fn corrupted_commit_marker_fails_recovery() {
+        let dir = tempdir().unwrap();
+        let genesis = compute_genesis_hash("corrupt-marker-test", 0);
+        let mut seg = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
+        seg.append(None, Bytes::from_static(b"data")).unwrap();
+        let commit_path = seg.commit_path.clone();
+        drop(seg);
+
+        // Corrupt the magic in the commit marker
+        let mut bytes = std::fs::read(&commit_path).unwrap();
+        bytes[0..4].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+        std::fs::write(&commit_path, &bytes).unwrap();
+
+        let err = match Segment::open_or_create(dir.path(), 0, genesis) {
+            Ok(_) => panic!("recovery accepted corrupted commit marker"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, VortexError::Io(_)));
+    }
+
+    #[test]
+    fn legacy_segment_with_torn_tail_is_truncated_and_upgraded() {
+        let dir = tempdir().unwrap();
+        let genesis = compute_genesis_hash("legacy-torn-tail", 0);
+        let mut seg = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
+        seg.append(None, Bytes::from_static(b"valid-record-1")).unwrap();
+        seg.append(None, Bytes::from_static(b"valid-record-2")).unwrap();
+        let valid_size = seg.size();
+        let segment_path = seg.path.clone();
+        drop(seg);
+
+        // Make it a legacy segment by removing .commit
+        std::fs::remove_file(commit_state_path(&segment_path)).unwrap();
+
+        // Simulate a power-loss crash by writing an incomplete record tail
+        let file = OpenOptions::new().write(true).open(&segment_path).unwrap();
+        let torn_len = 100u32;
+        file.write_all_at(&torn_len.to_be_bytes(), valid_size).unwrap();
+        file.write_all_at(&[0xAA, 0xBB, 0xCC], valid_size + 4).unwrap();
+        drop(file);
+
+        // Recovery of legacy segment must detect incomplete tail, truncate to valid_size,
+        // establish a durable .commit marker, and recover offset = 2
+        let recovered = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
+        assert_eq!(recovered.next_offset, 2);
+        assert_eq!(recovered.size(), valid_size);
+        assert!(commit_state_path(&segment_path).exists());
+        let records = recovered.read(0, 1024).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].value.as_ref(), b"valid-record-1");
+        assert_eq!(records[1].value.as_ref(), b"valid-record-2");
+    }
 }
