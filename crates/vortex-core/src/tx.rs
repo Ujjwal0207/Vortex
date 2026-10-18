@@ -7,6 +7,21 @@ use crate::record::Record;
 pub const CONTROL_TXN_COMMIT: &[u8] = b"__vortex_ctrl:commit__";
 pub const CONTROL_TXN_ABORT: &[u8] = b"__vortex_ctrl:abort__";
 
+/// Attribute bitfields for transactional records and control markers (Gap 2 / EOS)
+pub const FLAG_TRANSACTIONAL: u16 = 0x0001;
+pub const FLAG_CONTROL_RECORD: u16 = 0x0002;
+
+/// Standard control record markers
+pub const CONTROL_TXN_COMMIT_MARKER: u8 = 0;
+pub const CONTROL_TXN_ABORT_MARKER: u8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProducerTxnMeta {
+    pub producer_id: u64,
+    pub producer_epoch: u16,
+    pub sequence_num: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationLevel {
     ReadUncommitted = 0,
@@ -98,37 +113,24 @@ impl TransactionCoordinator {
         (pid, state.epoch)
     }
 
-    /// Filters records according to consumer isolation level.
-    /// Under ReadCommitted:
-    /// - Strips embedded transaction control markers (TxnCommit, TxnAbort)
-    /// - Drops uncommitted or aborted transaction ranges up to the Last Stable Offset (LSO).
+    /// Calculates the Last Stable Offset (LSO) for a partition.
+    /// Defined as the earliest first-offset of any currently open in-flight transaction.
+    /// If no transactions are in-flight, LSO equals the partition High Watermark.
+    pub fn calculate_lso(high_watermark: u64, in_flight_txns: &HashMap<u64, u64>) -> u64 {
+        if in_flight_txns.is_empty() {
+            high_watermark
+        } else {
+            *in_flight_txns.values().min().unwrap_or(&high_watermark)
+        }
+    }
+
+    /// The current `Record` format has no transaction metadata. ReadCommitted
+    /// therefore fails closed; records reaching this function are returned only
+    /// for ReadUncommitted. Do not infer control markers from user payload bytes.
     pub fn filter_by_isolation(records: &[Record], isolation: IsolationLevel) -> Vec<Record> {
         match isolation {
-            IsolationLevel::ReadUncommitted => records
-                .iter()
-                .filter(|r| r.value.as_ref() != CONTROL_TXN_COMMIT && r.value.as_ref() != CONTROL_TXN_ABORT)
-                .cloned()
-                .collect(),
-            IsolationLevel::ReadCommitted => {
-                let mut result = Vec::new();
-                let mut pending_batch = Vec::new();
-
-                for r in records {
-                    if r.value.as_ref() == CONTROL_TXN_COMMIT {
-                        // Commit: promote all pending records to committed stream
-                        result.append(&mut pending_batch);
-                    } else if r.value.as_ref() == CONTROL_TXN_ABORT {
-                        // Abort: permanently discard pending uncommitted records
-                        pending_batch.clear();
-                    } else {
-                        pending_batch.push(r.clone());
-                    }
-                }
-
-                // If non-transactional streaming, include remaining records
-                result.append(&mut pending_batch);
-                result
-            }
+            IsolationLevel::ReadUncommitted => records.to_vec(),
+            IsolationLevel::ReadCommitted => Vec::new(),
         }
     }
 }
@@ -153,24 +155,36 @@ mod tests {
     }
 
     #[test]
-    fn test_read_committed_lso_isolation() {
+    fn read_committed_fails_closed_without_transaction_metadata() {
         let hash = [0u8; 32];
-        let r1 = Record::new(hash, 0, None, Bytes::from("txn1-item-1"));
-        let r2 = Record::new(hash, 1, None, Bytes::from("txn1-item-2"));
-        let commit = Record::new(hash, 2, None, Bytes::from_static(CONTROL_TXN_COMMIT));
+        let records = vec![
+            Record::new(hash, 0, None, Bytes::from_static(CONTROL_TXN_COMMIT)),
+            Record::new(hash, 1, None, Bytes::from_static(CONTROL_TXN_ABORT)),
+        ];
+        assert!(TransactionCoordinator::filter_by_isolation(&records, IsolationLevel::ReadCommitted).is_empty());
+        assert_eq!(TransactionCoordinator::filter_by_isolation(&records, IsolationLevel::ReadUncommitted), records);
+    }
 
-        let r3 = Record::new(hash, 3, None, Bytes::from("txn2-item-1"));
-        let abort = Record::new(hash, 4, None, Bytes::from_static(CONTROL_TXN_ABORT));
+    #[test]
+    fn test_calculate_lso() {
+        let mut in_flight = HashMap::new();
+        // 1. No open transactions -> LSO equals high watermark
+        assert_eq!(TransactionCoordinator::calculate_lso(100, &in_flight), 100);
 
-        let r4 = Record::new(hash, 5, None, Bytes::from("standard-item"));
+        // 2. Open transaction at offset 40 -> LSO is 40
+        in_flight.insert(101, 40);
+        assert_eq!(TransactionCoordinator::calculate_lso(100, &in_flight), 40);
 
-        let stream = vec![r1, r2, commit, r3, abort, r4];
+        // 3. Another transaction at offset 60 -> LSO remains 40 (minimum)
+        in_flight.insert(102, 60);
+        assert_eq!(TransactionCoordinator::calculate_lso(100, &in_flight), 40);
 
-        // Under ReadCommitted: r3 is discarded due to abort; r1, r2, r4 are returned
-        let committed = TransactionCoordinator::filter_by_isolation(&stream, IsolationLevel::ReadCommitted);
-        assert_eq!(committed.len(), 3);
-        assert_eq!(committed[0].value, Bytes::from("txn1-item-1"));
-        assert_eq!(committed[1].value, Bytes::from("txn1-item-2"));
-        assert_eq!(committed[2].value, Bytes::from("standard-item"));
+        // 4. First transaction commits/aborts -> LSO advances to 60
+        in_flight.remove(&101);
+        assert_eq!(TransactionCoordinator::calculate_lso(100, &in_flight), 60);
+
+        // 5. All transactions complete -> LSO advances to high watermark
+        in_flight.remove(&102);
+        assert_eq!(TransactionCoordinator::calculate_lso(100, &in_flight), 100);
     }
 }
