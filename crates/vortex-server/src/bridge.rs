@@ -28,19 +28,6 @@ impl KafkaBridge {
         (18, 1, 1),  // ApiVersions
     ];
 
-    fn build_unsupported_version_response(api_key: i16) -> Bytes {
-        let mut buf = BytesMut::with_capacity(16);
-        if api_key == 18 {
-            buf.put_i16(35); // UNSUPPORTED_VERSION
-            buf.put_i32(0);  // Empty api_keys array
-            buf.put_i32(0);  // ThrottleTimeMs
-        } else {
-            buf.put_i32(0);  // ThrottleTimeMs
-            buf.put_i16(35); // UNSUPPORTED_VERSION
-        }
-        buf.freeze()
-    }
-
     pub async fn handle_frame(
         frame: KafkaFrame,
         engine: Arc<Engine>,
@@ -73,9 +60,13 @@ impl KafkaBridge {
             .find(|&&(k, _, _)| k == api_key_num)
         {
             if api_version < min_v || api_version > max_v {
-                let err_body = Self::build_unsupported_version_response(api_key_num);
-                return KafkaFrame::build_response(correlation_id, err_body);
+                // The response schema for an unsupported version is unknown, so
+                // fail closed and let the connection layer terminate this stream.
+                return Bytes::new();
             }
+        }
+        if api_key_num == 22 && !(0..=5).contains(&api_version) {
+            return Bytes::new();
         }
 
         let response_body = match frame.header.api_key {
@@ -91,14 +82,14 @@ impl KafkaBridge {
             KafkaApiKey::LeaveGroup => Self::handle_leave_group(&mut payload, &coordinator, api_version),
             KafkaApiKey::OffsetCommit => Self::handle_offset_commit(&mut payload, &coordinator, api_version),
             KafkaApiKey::OffsetFetch => Self::handle_offset_fetch(&mut payload, &coordinator, api_version),
-            KafkaApiKey::InitProducerId => Self::handle_init_producer_id(),
+            KafkaApiKey::InitProducerId => Self::handle_init_producer_id(api_version),
             KafkaApiKey::Unknown(k) => {
                 warn!("Unsupported Kafka ApiKey {}; returning empty response", k);
                 Bytes::new()
             }
         };
 
-        KafkaFrame::build_response(correlation_id, response_body)
+        KafkaFrame::build_versioned_response(correlation_id, api_key_num, api_version, response_body)
     }
 
     fn handle_api_versions(_version: i16) -> Bytes {
@@ -807,7 +798,7 @@ impl KafkaBridge {
         buf.freeze()
     }
 
-    fn handle_init_producer_id() -> Bytes {
+    fn handle_init_producer_id(api_version: i16) -> Bytes {
         // This API is intentionally not advertised. Returning a synthetic ID
         // would imply idempotence support that is not durable or connected to
         // the Produce path.
@@ -816,6 +807,9 @@ impl KafkaBridge {
         buf.put_i16(35); // UNSUPPORTED_VERSION / feature unavailable
         buf.put_i64(-1); // ProducerId
         buf.put_i16(-1); // ProducerEpoch
+        if api_version >= 2 {
+            buf.put_u8(0); // Empty flexible response TAG_BUFFER
+        }
         buf.freeze()
     }
 
@@ -1712,10 +1706,12 @@ mod tests {
         init_req.put_i16(3);  // v3
         init_req.put_i32(3001);
         KafkaCodec::put_string(&mut init_req, "txn-producer");
-        init_req.put_i16(-1); // TransactionalId: null
+        init_req.put_u8(0); // Flexible request-header TAG_BUFFER
+        init_req.put_u8(0); // Null compact TransactionalId
         init_req.put_i32(60000); // TransactionTimeoutMs
         init_req.put_i64(-1); // ProducerId: -1 (new allocation)
         init_req.put_i16(-1); // ProducerEpoch: -1
+        init_req.put_u8(0); // Request TAG_BUFFER
 
         let total_size = init_req.len() as i32;
         let mut frame_buf = BytesMut::new();
@@ -1728,12 +1724,14 @@ mod tests {
         let mut r = &resp[..];
         let _size = r.get_i32();
         assert_eq!(r.get_i32(), 3001);
+        assert_eq!(r.get_u8(), 0); // Flexible response-header TAG_BUFFER
         let _throttle = r.get_i32();
         assert_eq!(r.get_i16(), 35); // UNSUPPORTED_VERSION: idempotence is not implemented
         let pid = r.get_i64();
         assert_eq!(pid, -1); // No fake producer identity
         let epoch = r.get_i16();
         assert_eq!(epoch, -1);
+        assert_eq!(r.get_u8(), 0); // Flexible response TAG_BUFFER
     }
 
     #[tokio::test]
@@ -1859,7 +1857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unsupported_api_version_returns_error_code_35() {
+    async fn unsupported_api_versions_close_without_malformed_responses() {
         let tmp = tempdir().unwrap();
         let engine = Arc::new(Engine::new(tmp.path().to_path_buf()));
         let coordinator = Arc::new(ConsumerGroupCoordinator::new(tmp.path(), std::time::Duration::from_secs(30)).unwrap());
@@ -1870,6 +1868,7 @@ mod tests {
         req.put_i16(99); // Unsupported api_version 99
         req.put_i32(888); // CorrelationId
         KafkaCodec::put_string(&mut req, "test-client");
+        req.put_u8(0); // Flexible request-header TAG_BUFFER for Produce v99
 
         let total_size = req.len() as i32;
         let mut frame_buf = BytesMut::new();
@@ -1878,12 +1877,7 @@ mod tests {
 
         let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
         let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
-
-        let mut r = &resp[..];
-        let _size = r.get_i32();
-        assert_eq!(r.get_i32(), 888); // CorrelationId matches
-        let _throttle = r.get_i32();
-        assert_eq!(r.get_i16(), 35); // UNSUPPORTED_VERSION
+        assert!(resp.is_empty());
 
         // 2. Send ApiVersions request with unsupported version 99
         let mut api_req = BytesMut::new();
@@ -1891,6 +1885,7 @@ mod tests {
         api_req.put_i16(99); // Unsupported api_version 99
         api_req.put_i32(999); // CorrelationId
         KafkaCodec::put_string(&mut api_req, "test-client");
+        api_req.put_u8(0); // Flexible request-header TAG_BUFFER for ApiVersions v99
 
         let total_size = api_req.len() as i32;
         let mut frame_buf = BytesMut::new();
@@ -1899,11 +1894,7 @@ mod tests {
 
         let frame = KafkaFrame::decode(&mut frame_buf).unwrap().unwrap();
         let resp = KafkaBridge::handle_frame(frame, Arc::clone(&engine), Arc::clone(&coordinator)).await;
-
-        let mut r = &resp[..];
-        let _size = r.get_i32();
-        assert_eq!(r.get_i32(), 999); // CorrelationId matches
-        assert_eq!(r.get_i16(), 35);  // UNSUPPORTED_VERSION
+        assert!(resp.is_empty());
     }
 }
 
