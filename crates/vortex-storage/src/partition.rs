@@ -29,12 +29,14 @@ impl PartitionLog {
         let dir = base_dir.join(topic).join(format!("partition-{}", partition_id));
         fs::create_dir_all(&dir).map_err(|e| VortexError::Io(e.to_string()))?;
 
-        let mut segment_files: Vec<PathBuf> = fs::read_dir(&dir)
-            .map_err(|e| VortexError::Io(e.to_string()))?
-            .filter_map(|entry| entry.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("vtx"))
-            .collect();
+        let mut segment_files: Vec<PathBuf> = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| VortexError::Io(e.to_string()))? {
+            let entry = entry.map_err(|e| VortexError::Io(e.to_string()))?;
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("vtx") {
+                segment_files.push(p);
+            }
+        }
 
         segment_files.sort();
 
@@ -50,8 +52,16 @@ impl PartitionLog {
             let mut last_hash: Option<HashDigest> = None;
 
             for file_path in segment_files {
-                let filename = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("0");
-                let base_offset: u64 = filename.parse().unwrap_or(0);
+                let stem = file_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| VortexError::Io(format!("invalid segment filename {:?}", file_path)))?;
+                let base_offset: u64 = stem.parse().map_err(|_| {
+                    VortexError::Io(format!(
+                        "malformed segment filename {:?} (expected numeric base offset)",
+                        file_path
+                    ))
+                })?;
 
                 let genesis = last_hash.unwrap_or_else(|| compute_genesis_hash(topic, partition_id));
                 let seg = Segment::open_or_create(&dir, base_offset, genesis)?;
@@ -72,9 +82,42 @@ impl PartitionLog {
     /// Appends a new event to the partition. If the active segment exceeds `max_segment_bytes`,
     /// rolls to a new segment with seamless cryptographic chain continuity.
     pub fn append(&mut self, key: Option<Bytes>, value: Bytes) -> Result<Record> {
+        self.append_with_timestamp(key, value, None)
+    }
+
+    pub fn append_with_timestamp(
+        &mut self,
+        key: Option<Bytes>,
+        value: Bytes,
+        timestamp: Option<u64>,
+    ) -> Result<Record> {
+        let mut results = self.append_batch(vec![(key, value, timestamp)])?;
+        Ok(results.remove(0))
+    }
+
+    /// Appends an entire batch of records atomically.
+    /// If the batch would exceed the active segment's capacity, rolls to a new segment first,
+    /// ensuring the multi-record batch is not split across segments.
+    pub fn append_batch(
+        &mut self,
+        batch: Vec<(Option<Bytes>, Bytes, Option<u64>)>,
+    ) -> Result<Vec<Record>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_bytes: u64 = batch
+            .iter()
+            .map(|(k, v, _)| {
+                // Header (48B) + length prefix (4B) + key len + value len
+                52 + k.as_ref().map_or(0, |k| k.len() as u64) + v.len() as u64
+            })
+            .sum();
+
         let should_roll = {
             let active = self.active_segment();
-            active.size() >= self.max_segment_bytes
+            active.next_offset > active.base_offset
+                && active.size().saturating_add(batch_bytes) >= self.max_segment_bytes
         };
 
         if should_roll {
@@ -82,7 +125,7 @@ impl PartitionLog {
         }
 
         let active = self.active_segment_mut();
-        active.append(key, value)
+        active.append_batch(batch)
     }
 
     /// Explicitly rolls the active segment, creating a new segment that inherits
@@ -118,7 +161,15 @@ impl PartitionLog {
             });
         }
 
-        if start_offset >= next_offset {
+        if start_offset > next_offset {
+            return Err(VortexError::OffsetOutOfRange {
+                requested: start_offset,
+                earliest: first_offset,
+                latest: next_offset,
+            });
+        }
+
+        if start_offset == next_offset {
             return Ok(Vec::new());
         }
 
@@ -195,7 +246,9 @@ impl PartitionLog {
                 let base = seg.base_offset;
                 drop(seg); // close file handle before unlink
                 let path = self.dir.join(format!("{:020}.vtx", base));
-                let _ = fs::remove_file(path);
+                fs::remove_file(&path).map_err(|e| {
+                    VortexError::Io(format!("failed to remove pruned segment file {:?}: {e}", path))
+                })?;
                 pruned.push(base);
             } else {
                 break;
@@ -213,6 +266,11 @@ impl PartitionLog {
     /// Returns the next offset that will be assigned to an incoming message.
     pub fn next_offset(&self) -> u64 {
         self.active_segment().next_offset
+    }
+
+    /// Returns the first offset still retained in this partition.
+    pub fn earliest_offset(&self) -> u64 {
+        self.segments.first().map_or(0, |segment| segment.base_offset)
     }
 
     /// Returns a reference to the current active segment.
@@ -308,6 +366,59 @@ mod tests {
         let valid_records = log.read(earliest, 1024).unwrap();
         assert!(!valid_records.is_empty());
         assert_eq!(valid_records[0].offset, earliest);
+    }
+
+    #[test]
+    fn test_atomic_batch_append_and_roll() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open_or_create(dir.path(), "batch_topic", 0, 1200).unwrap();
+
+        // 1. Append a batch of 5 records
+        let batch1: Vec<(Option<Bytes>, Bytes, Option<u64>)> = (0..5)
+            .map(|i| (Some(Bytes::from(format!("key-{}", i))), Bytes::from(format!("val-{}", i)), Some(1000 + i)))
+            .collect();
+
+        let appended1 = log.append_batch(batch1).unwrap();
+        assert_eq!(appended1.len(), 5);
+        for i in 0..5 {
+            assert_eq!(appended1[i].offset, i as u64);
+            assert_eq!(appended1[i].timestamp, 1000 + i as u64);
+        }
+
+        // 2. Append another batch that exceeds the remaining segment bytes -> must roll before writing
+        let batch2: Vec<(Option<Bytes>, Bytes, Option<u64>)> = (5..15)
+            .map(|i| (Some(Bytes::from(format!("key-{}", i))), Bytes::from(format!("val-{}", i)), Some(2000 + i)))
+            .collect();
+
+        let appended2 = log.append_batch(batch2).unwrap();
+        assert_eq!(appended2.len(), 10);
+        assert!(log.segments.len() > 1, "Expected segment roll prior to large batch write");
+
+        // 3. Read back all records and verify continuous Blake3 hash integrity
+        let all_records = log.read(0, 100_000).unwrap();
+        assert_eq!(all_records.len(), 15);
+        for i in 1..15 {
+            assert_eq!(all_records[i].prev_hash, all_records[i - 1].record_hash);
+            assert_eq!(all_records[i].offset, i as u64);
+        }
+    }
+
+    #[test]
+    fn test_malformed_segment_name_rejected_safely() {
+        let dir = tempdir().unwrap();
+        let part_dir = dir.path().join("malformed_topic").join("partition-0");
+        std::fs::create_dir_all(&part_dir).unwrap();
+
+        // Write a malformed segment filename with non-numeric base offset
+        let malformed_file = part_dir.join("corrupted_segment.vtx");
+        std::fs::write(&malformed_file, b"garbage data").unwrap();
+
+        // PartitionLog initialization must reject malformed filename rather than reinterpreting as offset 0
+        let err = match PartitionLog::open_or_create(dir.path(), "malformed_topic", 0, 1024) {
+            Ok(_) => panic!("expected open_or_create to fail on malformed segment name"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, VortexError::Io(msg) if msg.contains("malformed segment filename")));
     }
 }
 
