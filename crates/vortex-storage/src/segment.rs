@@ -1,7 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use memmap2::{Mmap, MmapOptions};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use vortex_core::{error::Result, record::Record, HashDigest, VortexError};
@@ -43,7 +44,7 @@ impl Segment {
         let path = dir.join(filename);
         let file_exists = path.exists();
 
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -69,11 +70,9 @@ impl Segment {
                 header.put_u8(0);
             }
 
-            file.seek(SeekFrom::Start(0))
+            file.write_all_at(&header, 0)
                 .map_err(|e| VortexError::Io(e.to_string()))?;
-            file.write_all(&header)
-                .map_err(|e| VortexError::Io(e.to_string()))?;
-            file.flush()
+            file.sync_data()
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
             Ok(Self {
@@ -94,12 +93,9 @@ impl Segment {
         }
     }
 
-    fn recover_existing(path: PathBuf, mut file: File) -> Result<Self> {
-        file.seek(SeekFrom::Start(0))
-            .map_err(|e| VortexError::Io(e.to_string()))?;
-
+    fn recover_existing(path: PathBuf, file: File) -> Result<Self> {
         let mut header_buf = [0u8; 256];
-        file.read_exact(&mut header_buf)
+        file.read_exact_at(&mut header_buf, 0)
             .map_err(|e| VortexError::Io(e.to_string()))?;
 
         let mut reader = &header_buf[..];
@@ -121,14 +117,11 @@ impl Segment {
         let _created_at = reader.get_u64();
         let index_count = reader.get_u32() as usize;
 
-        // Read sparse index entries
-        file.seek(SeekFrom::Start(256))
-            .map_err(|e| VortexError::Io(e.to_string()))?;
-
         let mut index_entries = Vec::with_capacity(index_count);
-        for _ in 0..index_count {
+        for i in 0..index_count {
+            let entry_pos = 256 + (i * INDEX_ENTRY_SIZE) as u64;
             let mut entry_buf = [0u8; 16];
-            file.read_exact(&mut entry_buf)
+            file.read_exact_at(&mut entry_buf, entry_pos)
                 .map_err(|e| VortexError::Io(e.to_string()))?;
             let mut r = &entry_buf[..];
             index_entries.push(IndexEntry {
@@ -149,11 +142,8 @@ impl Segment {
         let mut last_hash = genesis_hash;
 
         while curr_pos + 8 <= file_len {
-            file.seek(SeekFrom::Start(curr_pos))
-                .map_err(|e| VortexError::Io(e.to_string()))?;
-
             let mut len_buf = [0u8; 4];
-            if file.read_exact(&mut len_buf).is_err() {
+            if file.read_exact_at(&mut len_buf, curr_pos).is_err() {
                 break;
             }
             let total_len = u32::from_be_bytes(len_buf) as u64;
@@ -165,12 +155,8 @@ impl Segment {
                 break;
             }
 
-            // Read and decode record to verify CRC and Blake3
-            file.seek(SeekFrom::Start(curr_pos))
-                .map_err(|e| VortexError::Io(e.to_string()))?;
-
             let mut record_raw = vec![0u8; 4 + total_len as usize];
-            file.read_exact(&mut record_raw)
+            file.read_exact_at(&mut record_raw, curr_pos)
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
             let mut slice = &record_raw[..];
@@ -205,36 +191,36 @@ impl Segment {
         })
     }
 
-    /// Appends a new payload to the segment, computing Blake3 hash, writing sparse index if needed,
-    /// and returning the committed record.
+    /// Appends a new payload to the segment using atomic positional I/O.
     pub fn append(&mut self, key: Option<Bytes>, value: Bytes) -> Result<Record> {
         let offset = self.next_offset;
         let record = Record::new(self.last_record_hash, offset, key, value);
         let encoded = record.encode();
         let encoded_len = encoded.len() as u64;
 
-        // Check if an index entry should be written
+        // Check if an index entry should be recorded
         if self.bytes_since_last_index >= SPARSE_INDEX_INTERVAL_BYTES
             || self.index_entries.is_empty()
         {
+            let entry = IndexEntry {
+                relative_offset: (offset - self.base_offset) as u32,
+                physical_position: self.current_data_position,
+                timestamp_delta: 0,
+            };
+
+            // Write index entry to Region A header on disk up to MAX_INDEX_ENTRIES
             if self.index_entries.len() < MAX_INDEX_ENTRIES {
-                let entry = IndexEntry {
-                    relative_offset: (offset - self.base_offset) as u32,
-                    physical_position: self.current_data_position,
-                    timestamp_delta: 0,
-                };
-                self.write_index_entry(&entry)?;
-                self.index_entries.push(entry);
-                self.bytes_since_last_index = 0;
+                self.write_index_entry(&entry, self.index_entries.len())?;
             }
+
+            // Always track in-memory so segments larger than 260 MB never freeze sparse indexing (Flaw 1.2)
+            self.index_entries.push(entry);
+            self.bytes_since_last_index = 0;
         }
 
-        // Append to data region
+        // Write directly at current_data_position via atomic positional write (Flaw 1.1)
         self.file
-            .seek(SeekFrom::Start(self.current_data_position))
-            .map_err(|e| VortexError::Io(e.to_string()))?;
-        self.file
-            .write_all(&encoded)
+            .write_all_at(&encoded, self.current_data_position)
             .map_err(|e| VortexError::Io(e.to_string()))?;
 
         self.current_data_position += encoded_len;
@@ -248,13 +234,8 @@ impl Segment {
         Ok(record)
     }
 
-    fn write_index_entry(&mut self, entry: &IndexEntry) -> Result<()> {
-        let entry_idx = self.index_entries.len();
+    fn write_index_entry(&self, entry: &IndexEntry, entry_idx: usize) -> Result<()> {
         let entry_pos = 256 + (entry_idx * INDEX_ENTRY_SIZE) as u64;
-
-        self.file
-            .seek(SeekFrom::Start(entry_pos))
-            .map_err(|e| VortexError::Io(e.to_string()))?;
 
         let mut buf = [0u8; 16];
         let mut writer = &mut buf[..];
@@ -263,15 +244,12 @@ impl Segment {
         writer.put_u32(entry.timestamp_delta);
 
         self.file
-            .write_all(&buf)
+            .write_all_at(&buf, entry_pos)
             .map_err(|e| VortexError::Io(e.to_string()))?;
 
-        // Update index count in header
+        // Update index count in header at offset 252
         self.file
-            .seek(SeekFrom::Start(256 - 4))
-            .map_err(|e| VortexError::Io(e.to_string()))?;
-        self.file
-            .write_all(&(self.index_entries.len() as u32 + 1).to_be_bytes())
+            .write_all_at(&(entry_idx as u32 + 1).to_be_bytes(), 252)
             .map_err(|e| VortexError::Io(e.to_string()))?;
 
         Ok(())
@@ -285,7 +263,9 @@ impl Segment {
     }
 
     /// Reads records starting from the given offset up to `max_bytes`.
-    pub fn read(&mut self, start_offset: u64, max_bytes: usize) -> Result<Vec<Record>> {
+    /// Operates purely with positional reads (`read_exact_at`), taking `&self` to allow
+    /// unlimited concurrent readers without mutex contention (Flaw 2.1).
+    pub fn read(&self, start_offset: u64, max_bytes: usize) -> Result<Vec<Record>> {
         if start_offset < self.base_offset || start_offset >= self.next_offset {
             return Ok(Vec::new());
         }
@@ -293,30 +273,21 @@ impl Segment {
         // Find nearest starting file position via binary search in sparse index
         let start_pos = self.find_file_position(start_offset);
 
-        // Read sequentially from start_pos until start_offset is reached and up to max_bytes
-        self.file
-            .seek(SeekFrom::Start(start_pos))
-            .map_err(|e| VortexError::Io(e.to_string()))?;
-
         let mut records = Vec::new();
         let mut bytes_read = 0;
         let mut curr_pos = start_pos;
 
         while curr_pos < self.current_data_position && bytes_read < max_bytes {
             let mut len_buf = [0u8; 4];
-            if self.file.read_exact(&mut len_buf).is_err() {
+            if self.file.read_exact_at(&mut len_buf, curr_pos).is_err() {
                 break;
             }
             let total_len = u32::from_be_bytes(len_buf) as usize;
             let full_record_len = 4 + total_len;
 
-            self.file
-                .seek(SeekFrom::Start(curr_pos))
-                .map_err(|e| VortexError::Io(e.to_string()))?;
-
             let mut raw_record = vec![0u8; full_record_len];
             self.file
-                .read_exact(&mut raw_record)
+                .read_exact_at(&mut raw_record, curr_pos)
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
             let mut slice = &raw_record[..];
