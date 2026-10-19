@@ -7,9 +7,23 @@ use vortex_core::{
     VortexError,
 };
 
+use crate::keyring::TwoSlotKeyring;
 use crate::segment::{commit_state_path, Segment};
 
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionVerifyReport {
+    pub topic: String,
+    pub partition_id: u32,
+    pub total_segments: usize,
+    pub total_records: u64,
+    pub earliest_offset: u64,
+    pub latest_offset: u64,
+    pub final_mmr_root: HashDigest,
+    pub final_record_hash: HashDigest,
+    pub is_valid: bool,
+}
 
 pub struct PartitionLog {
     pub topic: String,
@@ -17,6 +31,7 @@ pub struct PartitionLog {
     pub dir: PathBuf,
     pub max_segment_bytes: u64,
     pub segments: Vec<Segment>,
+    pub keyring: TwoSlotKeyring,
 }
 
 impl PartitionLog {
@@ -103,12 +118,17 @@ impl PartitionLog {
             }
         }
 
+        let current_next_offset = segments.last().map_or(0, |s| s.next_offset);
+        let keyring =
+            TwoSlotKeyring::open_or_create_with_offset(&dir, topic, partition_id, current_next_offset)?;
+
         Ok(Self {
             topic: topic.to_string(),
             partition_id,
             dir,
             max_segment_bytes,
             segments,
+            keyring,
         })
     }
 
@@ -158,7 +178,14 @@ impl PartitionLog {
         }
 
         let active = self.active_segment_mut();
-        active.append_batch(batch)
+        let appended = active.append_batch(batch)?;
+
+        for rec in &appended {
+            let encoded = rec.encode();
+            let _ = self.keyring.step_and_authenticate(&encoded, rec.offset + 1)?;
+        }
+
+        Ok(appended)
     }
 
     /// Explicitly rolls the active segment, creating a new segment that inherits
@@ -322,9 +349,119 @@ impl PartitionLog {
         Ok(pruned)
     }
 
-    /// Flushes the active segment to disk.
+    /// Flushes the active segment and checkpoints the forward-secure keyring to disk.
     pub fn flush(&mut self) -> Result<()> {
-        self.active_segment_mut().flush()
+        self.active_segment_mut().flush()?;
+        self.keyring.checkpoint()
+    }
+
+    /// Returns the writer MAC for a specific offset, if recorded.
+    pub fn writer_mac(&self, offset: u64) -> Result<Option<HashDigest>> {
+        self.keyring.read_mac(offset)
+    }
+
+    /// Returns the public one-way hash H(state) of the forward-secure ratchet.
+    pub fn public_ratchet_state_hash(&self) -> HashDigest {
+        self.keyring.public_state_hash()
+    }
+
+    /// Returns the active ratchet offset.
+    pub fn ratchet_offset(&self) -> u64 {
+        self.keyring.current_offset()
+    }
+
+    /// Offline verification function: fully checks all segments, cryptographic hash chains,
+    /// MMR roots, and offsets on disk with zero network or broker daemon involvement.
+    pub fn verify_offline(
+        partition_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+    ) -> Result<PartitionVerifyReport> {
+        let mut segment_files: Vec<PathBuf> = Vec::new();
+        if partition_dir.exists() {
+            for entry in fs::read_dir(partition_dir).map_err(|e| VortexError::Io(e.to_string()))? {
+                let entry = entry.map_err(|e| VortexError::Io(e.to_string()))?;
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("vtx") {
+                    segment_files.push(p);
+                }
+            }
+        }
+
+        segment_files.sort();
+
+        if segment_files.is_empty() {
+            return Ok(PartitionVerifyReport {
+                topic: topic.to_string(),
+                partition_id,
+                total_segments: 0,
+                total_records: 0,
+                earliest_offset: 0,
+                latest_offset: 0,
+                final_mmr_root: [0u8; 32],
+                final_record_hash: [0u8; 32],
+                is_valid: true,
+            });
+        }
+
+        let genesis = compute_genesis_hash(topic, partition_id);
+        let mut expected_genesis = genesis;
+        let mut expected_base_offset: Option<u64> = None;
+        let mut earliest_offset = 0u64;
+        let mut total_records = 0u64;
+        let mut final_mmr_root = [0u8; 32];
+        let mut final_record_hash = [0u8; 32];
+
+        for (idx, seg_path) in segment_files.iter().enumerate() {
+            let stem = seg_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| VortexError::Io("invalid segment path".into()))?;
+            let base_offset: u64 = stem
+                .parse()
+                .map_err(|_| VortexError::Io("invalid segment offset".into()))?;
+
+            if idx == 0 {
+                earliest_offset = base_offset;
+            }
+
+            if let Some(expected) = expected_base_offset {
+                if base_offset != expected {
+                    return Err(VortexError::Io(format!(
+                        "gap detected in partition sequence: expected base offset {expected}, found {base_offset}"
+                    )));
+                }
+            }
+
+            let loaded_seg = Segment::open_or_create(partition_dir, base_offset, expected_genesis)?;
+            if loaded_seg.base_offset != base_offset {
+                return Err(VortexError::Io(format!(
+                    "segment filename base offset {base_offset} mismatch with header {}",
+                    loaded_seg.base_offset
+                )));
+            }
+
+            let seg_records = loaded_seg.next_offset.saturating_sub(loaded_seg.base_offset);
+            total_records += seg_records;
+            expected_base_offset = Some(loaded_seg.next_offset);
+            expected_genesis = loaded_seg.last_record_hash;
+            final_mmr_root = loaded_seg.mmr_root();
+            final_record_hash = loaded_seg.last_record_hash;
+        }
+
+        let latest_offset = expected_base_offset.unwrap_or(0);
+
+        Ok(PartitionVerifyReport {
+            topic: topic.to_string(),
+            partition_id,
+            total_segments: segment_files.len(),
+            total_records,
+            earliest_offset,
+            latest_offset,
+            final_mmr_root,
+            final_record_hash,
+            is_valid: true,
+        })
     }
 
     /// Returns the next offset that will be assigned to an incoming message.
