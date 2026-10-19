@@ -17,16 +17,29 @@ pub struct Engine {
     data_dir: PathBuf,
     validator: IngressValidator,
     partitions: RwLock<HashMap<(String, u32), Arc<RwLock<PartitionLog>>>>,
+    #[allow(dead_code)]
+    pub reactor: crate::reactor::PartitionAffinityRouter,
 }
 
 impl Engine {
     pub fn new(data_dir: PathBuf) -> Self {
         let validator = IngressValidator::new(ValidationConfig::default());
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let reactor = crate::reactor::PartitionAffinityRouter::new(num_workers, 1024);
         Self {
             data_dir,
             validator,
             partitions: RwLock::new(HashMap::new()),
+            reactor,
         }
+    }
+
+    /// Returns a reference to the partition affinity reactor router.
+    #[allow(dead_code)]
+    pub fn reactor(&self) -> &crate::reactor::PartitionAffinityRouter {
+        &self.reactor
     }
 
     /// Handles a raw client frame and produces an appropriate response frame.
