@@ -884,6 +884,7 @@ dependencies = [
 name = "vortex-server"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "clap",
  "crc32fast",
