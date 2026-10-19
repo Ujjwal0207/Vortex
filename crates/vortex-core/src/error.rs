@@ -122,6 +122,15 @@ pub enum VortexError {
         slot: String,
         reason: String,
     },
+
+    #[error("Corrupted record at offset {offset}: {reason}")]
+    CorruptedRecord {
+        offset: u64,
+        reason: String,
+    },
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, VortexError>;
