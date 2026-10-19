@@ -16,6 +16,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 crc32fast.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
