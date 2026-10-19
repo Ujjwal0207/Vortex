@@ -126,6 +126,7 @@ int32_t vtx_prove(
  */
 int32_t vtx_verify_proof(
     const uint8_t* root,
+    const uint8_t* leaf_hash,
     const uint8_t* proof_bytes,
     size_t proof_len
 );
@@ -139,6 +140,22 @@ int32_t vtx_verify_partition(
     const char* partition_dir,
     const char* topic,
     uint32_t partition_id,
+    uint64_t* out_records_verified,
+    uint8_t* out_final_mmr_root,
+    uint8_t* out_final_hash
+);
+
+/**
+ * Verifies an entire partition directory offline and cryptographically replays the forward-secure ratchet
+ * using `genesis_seed` (32 bytes) to verify every stored writer MAC in partition.macs.
+ *
+ * @return 1 if completely verified, 0 if invalid, negative on error.
+ */
+int32_t vtx_verify_partition_with_seed(
+    const char* partition_dir,
+    const char* topic,
+    uint32_t partition_id,
+    const uint8_t* genesis_seed,
     uint64_t* out_records_verified,
     uint8_t* out_final_mmr_root,
     uint8_t* out_final_hash
