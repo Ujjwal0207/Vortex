@@ -109,6 +109,19 @@ pub enum VortexError {
         earliest: u64,
         latest: u64,
     },
+
+    #[error("Forward-secure ratchet verification failed for offset {offset}: expected MAC {expected}, actual {actual}")]
+    RatchetVerificationFailed {
+        offset: u64,
+        expected: String,
+        actual: String,
+    },
+
+    #[error("Keyring corrupted in slot '{slot}': {reason}")]
+    KeyringCorrupted {
+        slot: String,
+        reason: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, VortexError>;
