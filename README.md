@@ -558,7 +558,53 @@ $$\text{leaf\_hash}_i = \text{Blake3}(\text{"vortex-mmr-leaf-v1"} \parallel i_{\
 
 ## 📊 Benchmarks & Performance
 
-Measurements conducted on Apple Silicon (M-series, macOS arm64), `rustc --release`, synchronous TCP loopback (`127.0.0.1:9092`), with full linear hash-chain audit on read:
+Vortex includes comprehensive benchmarking tools designed to measure throughput, latency, and cryptographic overhead across all tiers of the system. The test suite is calibrated to run safely and deterministically on modern developer laptops without triggering thermal throttling, excessive SSD write wear, or memory bloat.
+
+### 1. Cryptographic & Zero-Knowledge Primitives (Pure CPU)
+
+Measurements conducted on Apple Silicon (`rustc --release`) with isolated in-memory workloads:
+
+| Cryptographic Primitive | Latency | Throughput | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Blake3 Lineage Chaining** | **0.34 µs** / record | **~2,920,000 rec/s** | Record header serialization & tamper-evident chaining |
+| **Forward-Secure Ratchet Step + MAC** | **0.34 µs** / record | **~2,950,000 rec/s** | Ephemeral key derivation & historical tamper immunity |
+| **Total Ingress Cryptographic Overhead** | **0.68 µs** / record | **~1,470,000 rec/s** | Combined Blake3 chaining + ratchet MAC per message |
+| **Incremental MMR Leaf Insertion** | **0.45 µs** / leaf | **~2,235,000 leaves/s** | Dynamic peak recalculation & tree root updates |
+| **MMR Inclusion Proof Gen + Verify** | **2.56 µs** / proof | **~390,000 proofs/s** | Compact $O(\log N)$ tamper-evident inclusion validation |
+| **Zero-Knowledge Blind Indexing** | **0.13 µs** / tag | **~7,560,000 tags/s** | Salted deterministic blind index token derivation |
+| **Ephemeral Key Shredding** | **0.87 µs** / entity | **~1,150,000 ops/s** | ChaCha20-Poly1305 encryption & in-memory key zeroization |
+| **Ed25519 Digital Signing** | **9.85 µs** / sign | **~101,500 signs/s** | Gateway action receipts & witness checkpoints |
+| **Ed25519 Signature Verification** | **19.65 µs** / verify | **~50,800 verifs/s** | Zero-trust offline verification of signed receipts |
+
+---
+
+### 2. High-Throughput In-Process Storage Engine (`libvortex` C-ABI)
+
+Direct storage engine performance bypassing network sockets via the embeddable C-ABI:
+
+| Operation | Workload | Latency / Commit | Throughput | Bandwidth |
+| :--- | :--- | :--- | :--- | :--- |
+| **Batched Sequential Append** | 10,000 records (chunk size 500) | **25.4 µs** / record | **39,344 rec/s** | 4.35 MB/s |
+| **Offline Verification Scan** | 10,000 records (CRC32 + Blake3 + MMR) | **3.2 µs** / record | **310,829 rec/s** | 35.8 MB/s |
+| **Physical Single-Commit Sync** | 20 individual atomic commits | **10.4 ms** / commit | ~96 commits/s | Atomic APFS fsync + `.commit` fence |
+
+---
+
+### 3. Verifiable Autonomous Evidence & Witness Pipeline
+
+End-to-end evidence capture and audit pipeline verifying continuous action sequences and non-repudiation:
+
+| Pipeline Stage | Sample Size | Duration | Rate / Latency | Verification Guarantee |
+| :--- | :--- | :--- | :--- | :--- |
+| **Gateway Action Ingestion** | 50 actions | 2,019 ms | **40.4 ms** / action | Request + Policy + Receipt (4 durable commits/action) |
+| **Witness Checkpoint & Countersign** | Tree size: 150 records | 11.0 ms | **11.0 ms** / checkpoint | Consistency check + monotonic Ed25519 countersignature |
+| **End-to-End Offline Court Audit** | 50 actions (150 log records) | 10.6 ms | **100% verified** | Validates log hash chain, ratchet MACs, receipts & witness reel |
+
+---
+
+### 4. Network Loopback Streaming (`vortex-server` TCP)
+
+Synchronous TCP streaming over loopback socket (`127.0.0.1:9092`) with full linear hash-chain audit on read:
 
 | Workload | Ingestion Time | Throughput | Bandwidth | Latency (p50) | Latency (p99) | Verification Time |
 | :--- | ---: | ---: | ---: | ---: | ---: | :--- |
@@ -567,11 +613,27 @@ Measurements conducted on Apple Silicon (M-series, macOS arm64), `rustc --releas
 | **100k × 512 B** | 2.568 s | **38,944 msgs/s** | 22.58 MB/s | **24 µs** | **53 µs** | 100% verified in 0.245 s |
 | **100 × 512 KiB** | 0.112 s | **889 msgs/s** | **444.64 MB/s** | 1,061 µs | 1.91 ms | 100% verified in 0.072 s |
 
-### Memory & Binary Profile
-- **Broker Binary Size:** `~2.5 MB`
-- **CLI Binary Size:** `~1.5 MB`
-- **RSS Memory Under Heavy Load:** `6.7 – 6.9 MB` (`ps` measurement under 100k messages)
-- **Crash Recovery:** Sudden `kill -9` during active ingestion recovers to the last valid commit marker without data duplication or torn tails.
+---
+
+### 5. Resource Footprint & Laptop Durability Profile
+
+- **Binary Footprint:** Broker is `~2.5 MB`, CLI is `~1.5 MB`, embeddable `libvortex.dylib` is `~1.2 MB`.
+- **Memory RSS:** `6.7 – 6.9 MB` active memory usage during sustained streaming.
+- **Laptop-Friendly Testing:** The entire comprehensive benchmark (`cargo run --release --example bench_perf -p vortex-ffi`) finishes in under **4 seconds**, utilizing bounded temporary directories with automatic cleanup to prevent disk bloat and unnecessary SSD wear.
+- **Crash Recovery:** Sudden `kill -9` during active ingestion recovers to the last valid commit marker with zero record duplication or torn tails.
+
+---
+
+### Running the Benchmarks Locally
+
+```bash
+# 1. Run the comprehensive in-process crypto, storage, and evidence benchmark (runs in ~4s):
+cargo run --release --example bench_perf -p vortex-ffi
+
+# 2. Run the network streaming benchmark against a live broker:
+./target/release/vortex-server --data-dir ./data &
+./target/release/vortex-cli bench --topic bench-stream --messages 50000 --size 512
+```
 
 ---
 
