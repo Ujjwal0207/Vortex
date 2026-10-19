@@ -1,0 +1,23 @@
+[package]
+name = "vortex-ffi"
+version = "0.1.0"
+edition = "2021"
+authors = ["Vortex Contributors"]
+license = "Apache-2.0"
+description = "Embeddable C-ABI library for Vortex: The SQLite of sealed logs"
+
+[lib]
+name = "vortex"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+vortex-core = { path = "../vortex-core" }
+vortex-storage = { path = "../vortex-storage" }
+bytes.workspace = true
+blake3.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
