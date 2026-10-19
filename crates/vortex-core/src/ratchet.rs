@@ -49,14 +49,26 @@ impl ForwardSecureRatchet {
         }
     }
 
-    /// Generates a deterministic genesis seed for a partition from topic, partition id, and a salt.
-    pub fn derive_genesis_seed(topic: &str, partition_id: u32, salt: &[u8]) -> [u8; 32] {
+    /// Generates a genesis seed for a partition from topic, partition id, and a 32-byte secret salt.
+    ///
+    /// The `secret_salt` MUST contain 32 bytes of cryptographic randomness (e.g., from an OS CSPRNG).
+    /// Public topic and partition identifiers are cryptographically bound to prevent cross-partition replay attacks.
+    pub fn derive_genesis_seed(topic: &str, partition_id: u32, secret_salt: &[u8; 32]) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"vortex-genesis-ratchet-v1");
-        hasher.update(salt);
+        hasher.update(b"vortex-genesis-ratchet-v2");
+        hasher.update(secret_salt);
         hasher.update(topic.as_bytes());
         hasher.update(&partition_id.to_be_bytes());
         *hasher.finalize().as_bytes()
+    }
+
+    /// Generates a cryptographically secure random genesis seed using the OS CSPRNG (`getrandom`).
+    pub fn generate_random_genesis_seed(topic: &str, partition_id: u32) -> Result<[u8; 32]> {
+        let mut secret_salt = [0u8; 32];
+        getrandom::getrandom(&mut secret_salt).map_err(|e| {
+            VortexError::Internal(format!("failed to generate secure CSPRNG seed: {e}"))
+        })?;
+        Ok(Self::derive_genesis_seed(topic, partition_id, &secret_salt))
     }
 
     /// Computes a forward-secure Message Authentication Code (MAC) for a raw record
@@ -294,5 +306,29 @@ mod tests {
 
         let res = KeyringSlot::decode(&encoded);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_genesis_seed_entropy_and_domain_separation() {
+        let topic = "audit-events";
+        let partition = 0;
+
+        // Two calls to generate_random_genesis_seed produce completely distinct seeds (high entropy)
+        let seed_1 = ForwardSecureRatchet::generate_random_genesis_seed(topic, partition).unwrap();
+        let seed_2 = ForwardSecureRatchet::generate_random_genesis_seed(topic, partition).unwrap();
+        assert_ne!(seed_1, seed_2, "CSPRNG must generate unique random seeds");
+
+        // Negative test: attacker attempting to forge genesis seed with old static/public salt fails
+        let secret_salt = [0x55u8; 32];
+        let legit_seed = ForwardSecureRatchet::derive_genesis_seed(topic, partition, &secret_salt);
+
+        // Attacker using public topic and partition ID but guessing salt or using public constants
+        let attacker_guess = [0xAAu8; 32];
+        let attacker_seed = ForwardSecureRatchet::derive_genesis_seed(topic, partition, &attacker_guess);
+        assert_ne!(legit_seed, attacker_seed);
+
+        // Domain separation across partitions: same secret salt, different partition produces distinct seeds
+        let diff_partition_seed = ForwardSecureRatchet::derive_genesis_seed(topic, 1, &secret_salt);
+        assert_ne!(legit_seed, diff_partition_seed);
     }
 }
