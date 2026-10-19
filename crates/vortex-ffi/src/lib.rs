@@ -144,24 +144,20 @@ pub unsafe extern "C" fn vtx_append(
         }
     };
 
-    match log.append(key_bytes, val_bytes) {
-        Ok(rec) => {
+    match log.append_authenticated(key_bytes, val_bytes) {
+        Ok(res) => {
             if !out_offset.is_null() {
-                *out_offset = rec.offset;
+                *out_offset = res.record.offset;
             }
             if !out_record_hash.is_null() {
-                std::ptr::copy_nonoverlapping(rec.record_hash.as_ptr(), out_record_hash, 32);
+                std::ptr::copy_nonoverlapping(res.record.record_hash.as_ptr(), out_record_hash, 32);
             }
             if !out_mmr_root.is_null() {
                 let root = log.active_segment().mmr_root();
                 std::ptr::copy_nonoverlapping(root.as_ptr(), out_mmr_root, 32);
             }
             if !out_writer_mac.is_null() {
-                if let Ok(Some(mac)) = log.writer_mac(rec.offset) {
-                    std::ptr::copy_nonoverlapping(mac.as_ptr(), out_writer_mac, 32);
-                } else {
-                    std::ptr::write_bytes(out_writer_mac, 0, 32);
-                }
+                std::ptr::copy_nonoverlapping(res.writer_mac.as_ptr(), out_writer_mac, 32);
             }
             VTX_OK
         }
@@ -363,15 +359,16 @@ pub unsafe extern "C" fn vtx_prove(
     VTX_OK
 }
 
-/// Verifies an MMR inclusion proof against a known root and leaf hash.
-/// Returns 1 if valid, 0 if invalid, or negative error code on malformed input.
+/// Verifies an MMR inclusion proof against a known root and caller-supplied leaf hash.
+/// Returns 1 if valid, 0 if invalid (or if leaf hash doesn't match), or negative error code on malformed input.
 #[no_mangle]
 pub unsafe extern "C" fn vtx_verify_proof(
     root: *const u8,
+    leaf_hash: *const u8,
     proof_bytes: *const u8,
     proof_len: usize,
 ) -> i32 {
-    if root.is_null() || proof_bytes.is_null() {
+    if root.is_null() || leaf_hash.is_null() || proof_bytes.is_null() {
         set_last_error("null pointer provided to vtx_verify_proof".into());
         return VTX_ERR_NULL_PTR;
     }
@@ -379,6 +376,10 @@ pub unsafe extern "C" fn vtx_verify_proof(
     let root_slice = std::slice::from_raw_parts(root, 32);
     let mut expected_root = [0u8; 32];
     expected_root.copy_from_slice(root_slice);
+
+    let leaf_slice = std::slice::from_raw_parts(leaf_hash, 32);
+    let mut expected_leaf = [0u8; 32];
+    expected_leaf.copy_from_slice(leaf_slice);
 
     let proof_slice = std::slice::from_raw_parts(proof_bytes, proof_len);
     let proof = match decode_proof(proof_slice) {
@@ -389,7 +390,7 @@ pub unsafe extern "C" fn vtx_verify_proof(
         }
     };
 
-    if proof.verify(&expected_root) {
+    if proof.verify(&expected_root, &expected_leaf) {
         1
     } else {
         0
@@ -442,6 +443,78 @@ pub unsafe extern "C" fn vtx_verify_partition(
                 std::ptr::copy_nonoverlapping(report.final_record_hash.as_ptr(), out_final_hash, 32);
             }
             if report.is_valid {
+                1
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            set_last_error(format!("verification error: {e}"));
+            VTX_ERR_VERIFICATION_FAILED
+        }
+    }
+}
+
+/// Verifies an entire partition directory offline and cryptographically replays the forward-secure ratchet
+/// using `genesis_seed` (32 bytes) to verify every stored writer MAC in `partition.macs`.
+///
+/// Returns 1 if completely verified, 0 if corrupt/invalid, or negative error code.
+#[no_mangle]
+pub unsafe extern "C" fn vtx_verify_partition_with_seed(
+    partition_dir: *const c_char,
+    topic: *const c_char,
+    partition_id: u32,
+    genesis_seed: *const u8,
+    out_records_verified: *mut u64,
+    out_final_mmr_root: *mut u8,
+    out_final_hash: *mut u8,
+) -> i32 {
+    if partition_dir.is_null() || topic.is_null() {
+        set_last_error("null pointer provided to vtx_verify_partition_with_seed".into());
+        return VTX_ERR_NULL_PTR;
+    }
+
+    let dir_str = match CStr::from_ptr(partition_dir).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!("invalid UTF-8 in partition_dir: {e}"));
+            return VTX_ERR_INVALID_ARG;
+        }
+    };
+
+    let topic_str = match CStr::from_ptr(topic).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!("invalid UTF-8 in topic: {e}"));
+            return VTX_ERR_INVALID_ARG;
+        }
+    };
+
+    let seed_opt = if !genesis_seed.is_null() {
+        let mut seed = [0u8; 32];
+        std::ptr::copy_nonoverlapping(genesis_seed, seed.as_mut_ptr(), 32);
+        Some(seed)
+    } else {
+        None
+    };
+
+    match PartitionLog::verify_offline_with_seed(
+        Path::new(dir_str),
+        topic_str,
+        partition_id,
+        seed_opt.as_ref(),
+    ) {
+        Ok(report) => {
+            if !out_records_verified.is_null() {
+                *out_records_verified = report.total_records;
+            }
+            if !out_final_mmr_root.is_null() {
+                std::ptr::copy_nonoverlapping(report.final_mmr_root.as_ptr(), out_final_mmr_root, 32);
+            }
+            if !out_final_hash.is_null() {
+                std::ptr::copy_nonoverlapping(report.final_record_hash.as_ptr(), out_final_hash, 32);
+            }
+            if report.is_valid && (seed_opt.is_none() || report.macs_verified) {
                 1
             } else {
                 0
@@ -603,6 +676,8 @@ mod tests {
             let mut mmr_root = [0u8; 32];
             let mut writer_mac = [0u8; 32];
 
+            let mut rec_hash_5 = [0u8; 32];
+
             // Append 10 records
             for i in 0..10 {
                 let key = format!("k-{}", i);
@@ -623,6 +698,10 @@ mod tests {
                 assert_ne!(record_hash, [0u8; 32]);
                 assert_ne!(mmr_root, [0u8; 32]);
                 assert_ne!(writer_mac, [0u8; 32]);
+
+                if i == 5 {
+                    rec_hash_5 = record_hash;
+                }
             }
 
             // Flush
@@ -635,9 +714,15 @@ mod tests {
             assert_eq!(res, VTX_OK);
             assert!(proof_len > 0);
 
-            // Verify MMR proof offline with root
-            let verify_res = vtx_verify_proof(mmr_root.as_ptr(), proof_buf.as_ptr(), proof_len);
-            assert_eq!(verify_res, 1);
+            // Verify MMR proof offline with root AND matching leaf hash
+            let verify_res = vtx_verify_proof(mmr_root.as_ptr(), rec_hash_5.as_ptr(), proof_buf.as_ptr(), proof_len);
+            assert_eq!(verify_res, 1, "proof must verify with correct leaf hash");
+
+            // Negative test: verify with wrong leaf hash MUST fail (returns 0)
+            let mut wrong_leaf = rec_hash_5;
+            wrong_leaf[0] ^= 0xFF;
+            let reject_res = vtx_verify_proof(mmr_root.as_ptr(), wrong_leaf.as_ptr(), proof_buf.as_ptr(), proof_len);
+            assert_eq!(reject_res, 0, "proof must be rejected if caller supplies wrong leaf hash");
 
             // Check public ratchet state hash
             let mut state_hash = [0u8; 32];
