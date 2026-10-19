@@ -1,16 +1,28 @@
 use bytes::Bytes;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 use vortex_core::{
-    compute_genesis_hash, error::Result, record::Record, HashDigest, MmrInclusionProof,
-    VortexError,
+    compute_genesis_hash, error::Result, record::Record, ForwardSecureRatchet, HashDigest,
+    MmrInclusionProof, VortexError,
 };
 
-use crate::keyring::TwoSlotKeyring;
+use crate::keyring::{TwoSlotKeyring, PARTITION_MACS_FILE};
 use crate::segment::{commit_state_path, Segment};
 
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
+
+/// The result of an authenticated append operation, returning both the committed `Record`
+/// and its forward-secure writer authentication MAC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendResult {
+    pub record: Record,
+    pub writer_mac: HashDigest,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PartitionVerifyReport {
@@ -23,6 +35,7 @@ pub struct PartitionVerifyReport {
     pub final_mmr_root: HashDigest,
     pub final_record_hash: HashDigest,
     pub is_valid: bool,
+    pub macs_verified: bool,
 }
 
 pub struct PartitionLog {
@@ -35,12 +48,34 @@ pub struct PartitionLog {
 }
 
 impl PartitionLog {
-    /// Opens an existing partition directory or initializes a new partition log.
+    /// Opens an existing partition directory or initializes a new partition log with a random CSPRNG genesis seed.
     pub fn open_or_create(
         base_dir: &Path,
         topic: &str,
         partition_id: u32,
         max_segment_bytes: u64,
+    ) -> Result<Self> {
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, None)
+    }
+
+    /// Opens an existing partition directory or initializes a new partition log with an explicit secret genesis seed.
+    /// Useful for testing, deterministic replication, and escrowed audit verification.
+    pub fn open_or_create_with_seed(
+        base_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+        max_segment_bytes: u64,
+        genesis_seed: [u8; 32],
+    ) -> Result<Self> {
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, Some(genesis_seed))
+    }
+
+    fn open_or_create_internal(
+        base_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+        max_segment_bytes: u64,
+        genesis_seed: Option<[u8; 32]>,
     ) -> Result<Self> {
         let dir = base_dir.join(topic).join(format!("partition-{}", partition_id));
         fs::create_dir_all(&dir).map_err(|e| VortexError::Io(e.to_string()))?;
@@ -119,8 +154,21 @@ impl PartitionLog {
         }
 
         let current_next_offset = segments.last().map_or(0, |s| s.next_offset);
-        let keyring =
-            TwoSlotKeyring::open_or_create_with_offset(&dir, topic, partition_id, current_next_offset)?;
+        let keyring = match genesis_seed {
+            Some(seed) => TwoSlotKeyring::open_or_create_with_seed(
+                &dir,
+                topic,
+                partition_id,
+                current_next_offset,
+                seed,
+            )?,
+            None => TwoSlotKeyring::open_or_create_with_offset(
+                &dir,
+                topic,
+                partition_id,
+                current_next_offset,
+            )?,
+        };
 
         Ok(Self {
             topic: topic.to_string(),
@@ -132,29 +180,29 @@ impl PartitionLog {
         })
     }
 
-    /// Appends a new event to the partition. If the active segment exceeds `max_segment_bytes`,
-    /// rolls to a new segment with seamless cryptographic chain continuity.
-    pub fn append(&mut self, key: Option<Bytes>, value: Bytes) -> Result<Record> {
-        self.append_with_timestamp(key, value, None)
+    /// Appends a new event and returns both the committed record and its forward-secure writer authentication MAC.
+    pub fn append_authenticated(&mut self, key: Option<Bytes>, value: Bytes) -> Result<AppendResult> {
+        self.append_authenticated_with_timestamp(key, value, None)
     }
 
-    pub fn append_with_timestamp(
+    pub fn append_authenticated_with_timestamp(
         &mut self,
         key: Option<Bytes>,
         value: Bytes,
         timestamp: Option<u64>,
-    ) -> Result<Record> {
-        let mut results = self.append_batch(vec![(key, value, timestamp)])?;
-        Ok(results.remove(0))
+    ) -> Result<AppendResult> {
+        let mut results = self.append_batch_authenticated(vec![(key, value, timestamp)])?;
+        results.pop().ok_or_else(|| VortexError::CorruptedRecord {
+            offset: 0,
+            reason: "empty append result".into(),
+        })
     }
 
-    /// Appends an entire batch of records atomically.
-    /// If the batch would exceed the active segment's capacity, rolls to a new segment first,
-    /// ensuring the multi-record batch is not split across segments.
-    pub fn append_batch(
+    /// Appends an entire batch of records atomically and returns each committed record with its writer MAC.
+    pub fn append_batch_authenticated(
         &mut self,
         batch: Vec<(Option<Bytes>, Bytes, Option<u64>)>,
-    ) -> Result<Vec<Record>> {
+    ) -> Result<Vec<AppendResult>> {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
@@ -180,12 +228,44 @@ impl PartitionLog {
         let active = self.active_segment_mut();
         let appended = active.append_batch(batch)?;
 
-        for rec in &appended {
+        let mut results = Vec::with_capacity(appended.len());
+        for rec in appended {
             let encoded = rec.encode();
-            let _ = self.keyring.step_and_authenticate(&encoded, rec.offset + 1)?;
+            let writer_mac = self.keyring.step_and_authenticate(&encoded, rec.offset + 1)?;
+            results.push(AppendResult {
+                record: rec,
+                writer_mac,
+            });
         }
 
-        Ok(appended)
+        Ok(results)
+    }
+
+    /// Appends a new event to the partition. If the active segment exceeds `max_segment_bytes`,
+    /// rolls to a new segment with seamless cryptographic chain continuity.
+    pub fn append(&mut self, key: Option<Bytes>, value: Bytes) -> Result<Record> {
+        self.append_with_timestamp(key, value, None)
+    }
+
+    pub fn append_with_timestamp(
+        &mut self,
+        key: Option<Bytes>,
+        value: Bytes,
+        timestamp: Option<u64>,
+    ) -> Result<Record> {
+        let res = self.append_authenticated_with_timestamp(key, value, timestamp)?;
+        Ok(res.record)
+    }
+
+    /// Appends an entire batch of records atomically.
+    /// If the batch would exceed the active segment's capacity, rolls to a new segment first,
+    /// ensuring the multi-record batch is not split across segments.
+    pub fn append_batch(
+        &mut self,
+        batch: Vec<(Option<Bytes>, Bytes, Option<u64>)>,
+    ) -> Result<Vec<Record>> {
+        let results = self.append_batch_authenticated(batch)?;
+        Ok(results.into_iter().map(|r| r.record).collect())
     }
 
     /// Explicitly rolls the active segment, creating a new segment that inherits
@@ -287,6 +367,22 @@ impl PartitionLog {
         None
     }
 
+    /// Returns the active segment's current MMR root.
+    pub fn active_mmr_root(&self) -> HashDigest {
+        self.segments.last().map(|s| s.mmr_root()).unwrap_or([0u8; 32])
+    }
+
+    /// Returns the active segment's current MMR tree size (leaf count).
+    pub fn active_tree_size(&self) -> u64 {
+        self.segments.last().map(|s| s.mmr.count()).unwrap_or(0)
+    }
+
+    /// Generates an MMR consistency proof proving that the tree at `old_size`
+    /// is an exact append-only prefix of the active tree at current size.
+    pub fn generate_consistency_proof(&self, old_size: u64) -> Option<vortex_core::MmrConsistencyProof> {
+        self.segments.last().and_then(|s| s.mmr.generate_consistency_proof(old_size))
+    }
+
     /// Prunes expired sealed segments based on size (retention_bytes) and time (retention_ms).
     /// The active segment is NEVER pruned to guarantee append continuity.
     /// Returns the list of pruned segment base offsets.
@@ -377,6 +473,17 @@ impl PartitionLog {
         topic: &str,
         partition_id: u32,
     ) -> Result<PartitionVerifyReport> {
+        Self::verify_offline_with_seed(partition_dir, topic, partition_id, None)
+    }
+
+    /// Verifies partition integrity and optionally replays the forward-secure ratchet from `genesis_seed`
+    /// to cryptographically prove every single stored writer MAC in `partition.macs`.
+    pub fn verify_offline_with_seed(
+        partition_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+        genesis_seed: Option<&[u8; 32]>,
+    ) -> Result<PartitionVerifyReport> {
         let mut segment_files: Vec<PathBuf> = Vec::new();
         if partition_dir.exists() {
             for entry in fs::read_dir(partition_dir).map_err(|e| VortexError::Io(e.to_string()))? {
@@ -401,6 +508,7 @@ impl PartitionLog {
                 final_mmr_root: [0u8; 32],
                 final_record_hash: [0u8; 32],
                 is_valid: true,
+                macs_verified: true,
             });
         }
 
@@ -411,6 +519,8 @@ impl PartitionLog {
         let mut total_records = 0u64;
         let mut final_mmr_root = [0u8; 32];
         let mut final_record_hash = [0u8; 32];
+
+        let mut all_segments = Vec::with_capacity(segment_files.len());
 
         for (idx, seg_path) in segment_files.iter().enumerate() {
             let stem = seg_path
@@ -447,9 +557,81 @@ impl PartitionLog {
             expected_genesis = loaded_seg.last_record_hash;
             final_mmr_root = loaded_seg.mmr_root();
             final_record_hash = loaded_seg.last_record_hash;
+            all_segments.push(loaded_seg);
         }
 
         let latest_offset = expected_base_offset.unwrap_or(0);
+
+        // Verification of partition.macs sidecar log
+        let mut macs_verified = false;
+        let macs_path = partition_dir.join(PARTITION_MACS_FILE);
+        if total_records > 0 {
+            if !macs_path.exists() {
+                return Err(VortexError::Io(format!(
+                    "missing required authentication sidecar {:?} for partition with {total_records} records",
+                    macs_path
+                )));
+            }
+
+            let macs_file = OpenOptions::new()
+                .read(true)
+                .open(&macs_path)
+                .map_err(|e| VortexError::Io(format!("failed to open macs log {:?}: {e}", macs_path)))?;
+
+            let macs_len = macs_file.metadata().map_err(|e| VortexError::Io(e.to_string()))?.len();
+            let expected_macs_len = total_records * 32;
+            if macs_len < expected_macs_len {
+                return Err(VortexError::Io(format!(
+                    "partition.macs log is truncated: expected at least {expected_macs_len} bytes, found {macs_len} bytes"
+                )));
+            }
+
+            let mut ratchet = genesis_seed.map(|seed| ForwardSecureRatchet::new(*seed));
+
+            for seg in &all_segments {
+                let records = seg.read(seg.base_offset, usize::MAX)?;
+                for rec in records {
+                    let mut stored_mac = [0u8; 32];
+                    let byte_pos = rec.offset * 32;
+                    #[cfg(unix)]
+                    macs_file
+                        .read_exact_at(&mut stored_mac, byte_pos)
+                        .map_err(|e| VortexError::Io(format!("failed to read stored MAC at offset {}: {e}", rec.offset)))?;
+                    #[cfg(windows)]
+                    macs_file
+                        .seek_read(&mut stored_mac, byte_pos)
+                        .map_err(|e| VortexError::Io(format!("failed to read stored MAC at offset {}: {e}", rec.offset)))?;
+
+                    if stored_mac == [0u8; 32] {
+                        return Err(VortexError::CorruptedRecord {
+                            offset: rec.offset,
+                            reason: "stored writer MAC is all zeros".into(),
+                        });
+                    }
+
+                    if let Some(ref mut r) = ratchet {
+                        let encoded = rec.encode();
+                        let expected_mac = r.compute_mac(&encoded);
+                        if expected_mac != stored_mac {
+                            return Err(VortexError::CorruptedRecord {
+                                offset: rec.offset,
+                                reason: format!(
+                                    "MAC forgery or corruption detected at offset {}: stored MAC does not match ratchet state",
+                                    rec.offset
+                                ),
+                            });
+                        }
+                        r.step(rec.offset + 1);
+                    }
+                }
+            }
+
+            if genesis_seed.is_some() {
+                macs_verified = true;
+            }
+        } else {
+            macs_verified = true;
+        }
 
         Ok(PartitionVerifyReport {
             topic: topic.to_string(),
@@ -461,6 +643,7 @@ impl PartitionLog {
             final_mmr_root,
             final_record_hash,
             is_valid: true,
+            macs_verified,
         })
     }
 
@@ -751,15 +934,87 @@ mod tests {
         // Verify MMR inclusion proof for a record in the cold segment (segment 0)
         let proof_seg0 = log.generate_inclusion_proof(2).expect("proof for offset 2 must exist");
         assert_eq!(proof_seg0.leaf_index, 2);
-        assert!(proof_seg0.verify(&log.segments[0].mmr_root()));
+        assert!(proof_seg0.verify(&log.segments[0].mmr_root(), &proof_seg0.leaf_hash));
+
+        // Negative test: mismatched leaf fails
+        let mut bad_leaf = proof_seg0.leaf_hash;
+        bad_leaf[0] ^= 0xAA;
+        assert!(!proof_seg0.verify(&log.segments[0].mmr_root(), &bad_leaf));
 
         // Verify MMR inclusion proof for a record in the active segment (segment 1)
         let proof_seg1 = log.generate_inclusion_proof(7).expect("proof for offset 7 must exist");
         assert_eq!(proof_seg1.leaf_index, 2); // 7 - base_offset(5) = 2
-        assert!(proof_seg1.verify(&log.segments[1].mmr_root()));
+        assert!(proof_seg1.verify(&log.segments[1].mmr_root(), &proof_seg1.leaf_hash));
 
         // Out of range proof returns None
         assert!(log.generate_inclusion_proof(99).is_none());
+    }
+
+    #[test]
+    fn test_partition_authenticated_append_and_offline_mac_verification() {
+        let dir = tempdir().unwrap();
+        let topic = "settlement-stream";
+        let partition_id = 0;
+        let genesis_seed = [0x42u8; 32];
+
+        // 1. Initialize partition with explicit genesis seed
+        let mut appended_macs = Vec::new();
+        {
+            let mut log = PartitionLog::open_or_create_with_seed(
+                dir.path(),
+                topic,
+                partition_id,
+                1024 * 1024,
+                genesis_seed,
+            )
+            .unwrap();
+
+            // Append authenticated records
+            for i in 0..10 {
+                let res = log
+                    .append_authenticated(
+                        Some(Bytes::from(format!("k-{}", i))),
+                        Bytes::from(format!("val-{}", i)),
+                    )
+                    .unwrap();
+                assert_eq!(res.record.offset, i);
+                assert_ne!(res.writer_mac, [0u8; 32]);
+                appended_macs.push(res.writer_mac);
+            }
+
+            log.flush().unwrap();
+        }
+
+        let partition_dir = dir.path().join(topic).join(format!("partition-{}", partition_id));
+
+        // 2. Standard offline verification (structural check on segments and MACs file)
+        let unseeded_report = PartitionLog::verify_offline(&partition_dir, topic, partition_id).unwrap();
+        assert!(unseeded_report.is_valid);
+        assert_eq!(unseeded_report.total_records, 10);
+        assert!(!unseeded_report.macs_verified, "unseeded verification does not replay ratchet");
+
+        // 3. Seeded offline verification: replays ratchet from genesis seed, verifies all 10 MACs
+        let seeded_report =
+            PartitionLog::verify_offline_with_seed(&partition_dir, topic, partition_id, Some(&genesis_seed)).unwrap();
+        assert!(seeded_report.is_valid);
+        assert_eq!(seeded_report.total_records, 10);
+        assert!(seeded_report.macs_verified, "seeded verification must replay and verify all MACs");
+
+        // 4. Negative test: verification with wrong seed fails (detects MAC forgery)
+        let wrong_seed = [0x99u8; 32];
+        let err_wrong_seed =
+            PartitionLog::verify_offline_with_seed(&partition_dir, topic, partition_id, Some(&wrong_seed));
+        assert!(err_wrong_seed.is_err(), "must fail verification when seed is wrong");
+
+        // 5. Negative test: tampered MAC in partition.macs is detected
+        let macs_path = partition_dir.join(PARTITION_MACS_FILE);
+        let mut macs_bytes = std::fs::read(&macs_path).unwrap();
+        macs_bytes[15] ^= 0xFF; // Corrupt record 0's MAC
+        std::fs::write(&macs_path, &macs_bytes).unwrap();
+
+        let err_tampered_mac =
+            PartitionLog::verify_offline_with_seed(&partition_dir, topic, partition_id, Some(&genesis_seed));
+        assert!(err_tampered_mac.is_err(), "must fail verification when MAC file is tampered");
     }
 }
 
