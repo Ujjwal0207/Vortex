@@ -14,7 +14,7 @@ pub use error::{Result, VortexError};
 pub use evidence::{
     compute_commitment, generate_signing_key, verify_signature, ActionEvidenceRecord,
     ActionRequest, ActionVerdict, ExecutorReceipt, GatewayReceipt, PolicyDecision, SignedCheckpoint,
-    WitnessCountersignature,
+    WitnessCountersignature, SignatureBytes, Signer, SigningKey,
 };
 pub use hash::{compute_genesis_hash, compute_record_hash, verify_record_integrity, HashDigest};
 pub use mmr::{MerkleMountainRange, MmrConsistencyProof, MmrInclusionProof, PeakConsistencyProof};
