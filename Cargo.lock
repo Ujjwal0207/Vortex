@@ -858,6 +858,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-ffi"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bytes",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "vortex-core",
+ "vortex-storage",
+]
+
+[[package]]
 name = "vortex-guard"
 version = "0.1.0"
 dependencies = [
