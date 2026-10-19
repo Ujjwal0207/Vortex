@@ -41,6 +41,9 @@ fn main() {
     let mut last_mmr_root = [0u8; 32];
     let mut last_writer_mac = [0u8; 32];
 
+    let mut target_hash = [0u8; 32];
+    let target_offset = 250u64;
+
     // Single message appends
     for i in 0..single_records {
         let key = format!("tx-single-{:06}", i);
@@ -60,6 +63,9 @@ fn main() {
             )
         };
         assert_eq!(res, VTX_OK, "vtx_append failed at index {}", i);
+        if i as u64 == target_offset {
+            target_hash = last_record_hash;
+        }
     }
 
     // Batched appends in chunks of 500
@@ -118,7 +124,6 @@ fn main() {
     println!("      ✓ Forward-secure ratchet H(state): {}", hex_fmt(&public_ratchet_hash));
 
     // Generate O(log N) MMR proof for a specific record
-    let target_offset = 5_000u64;
     println!("\n[3/6] Generating O(log N) MMR inclusion proof for record offset {}...", target_offset);
     let mut proof_buf = [0u8; 2048];
     let mut proof_len = 0usize;
@@ -135,13 +140,22 @@ fn main() {
     assert_eq!(res, VTX_OK, "vtx_prove failed");
     println!("      ✓ Compact inclusion proof generated: {} bytes", proof_len);
 
-    // Verify proof
-    println!("\n[4/6] Verifying inclusion proof against current MMR bagged root...");
+    // Verify proof bound to caller's expected record hash
+    println!("\n[4/6] Verifying inclusion proof against current MMR root and target record hash...");
     let valid = unsafe {
-        vtx_verify_proof(last_mmr_root.as_ptr(), proof_buf.as_ptr(), proof_len)
+        vtx_verify_proof(last_mmr_root.as_ptr(), target_hash.as_ptr(), proof_buf.as_ptr(), proof_len)
     };
     assert_eq!(valid, 1, "MMR inclusion proof verification failed");
     println!("      ✓ Proof verification: VALID (record {} cryptographically bound to root)", target_offset);
+
+    // Negative check: verify that a wrong record hash is rejected
+    let mut wrong_hash = target_hash;
+    wrong_hash[0] ^= 0xFF;
+    let rejected = unsafe {
+        vtx_verify_proof(last_mmr_root.as_ptr(), wrong_hash.as_ptr(), proof_buf.as_ptr(), proof_len)
+    };
+    assert_eq!(rejected, 0, "MMR proof must reject mismatched record hash");
+    println!("      ✓ Tamper detection: VALID (unbound record substitution correctly rejected)");
 
     // Flush and Close
     println!("\n[5/6] Flushing and destroying in-memory partition handle (simulating process exit)...");
