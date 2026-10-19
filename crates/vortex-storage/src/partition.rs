@@ -3,7 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use vortex_core::{
-    compute_genesis_hash, error::Result, record::Record, HashDigest, VortexError,
+    compute_genesis_hash, error::Result, record::Record, HashDigest, MmrInclusionProof,
+    VortexError,
 };
 
 use crate::segment::{commit_state_path, Segment};
@@ -217,13 +218,21 @@ impl PartitionLog {
         let mut records = Vec::new();
         let mut curr_offset = start_offset;
         let mut bytes_accumulated = 0;
+        let total_segs = self.segments.len();
 
-        for seg in &self.segments[seg_idx..] {
+        for (i, seg) in self.segments[seg_idx..].iter().enumerate() {
             if bytes_accumulated >= max_bytes {
                 break;
             }
 
-            let batch = seg.read(curr_offset, max_bytes - bytes_accumulated)?;
+            // Historical sealed segments drop kernel page cache after reading (Flaw 6.3),
+            // while the active head segment keeps hot pages cached in RAM.
+            let is_active = (seg_idx + i) == (total_segs.saturating_sub(1));
+            let batch = if is_active {
+                seg.read(curr_offset, max_bytes - bytes_accumulated)?
+            } else {
+                seg.read_cold(curr_offset, max_bytes - bytes_accumulated)?
+            };
             if batch.is_empty() {
                 continue;
             }
@@ -239,6 +248,16 @@ impl PartitionLog {
         }
 
         Ok(records)
+    }
+
+    /// Generates an O(log N) cryptographic MMR inclusion proof for the record at `offset`.
+    pub fn generate_inclusion_proof(&self, offset: u64) -> Option<MmrInclusionProof> {
+        for seg in &self.segments {
+            if offset >= seg.base_offset && offset < seg.next_offset {
+                return seg.generate_inclusion_proof(offset);
+            }
+        }
+        None
     }
 
     /// Prunes expired sealed segments based on size (retention_bytes) and time (retention_ms).
@@ -569,5 +588,42 @@ mod tests {
         assert_eq!(records[0].value.as_ref(), b"segment 0 record");
         assert_eq!(records[1].value.as_ref(), b"segment 1 record");
     }
+
+    #[test]
+    fn test_partition_mmr_proof_and_cold_reads_across_segments() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open_or_create(dir.path(), "mmr_partition", 0, 1024 * 1024).unwrap();
+
+        // Write records into segment 0
+        for i in 0..5 {
+            log.append(None, Bytes::from(format!("seg0-{}", i))).unwrap();
+        }
+        log.roll_segment().unwrap();
+
+        // Write records into segment 1
+        for i in 5..10 {
+            log.append(None, Bytes::from(format!("seg1-{}", i))).unwrap();
+        }
+
+        assert_eq!(log.segments.len(), 2);
+
+        // Cross-segment read exercises cold read on segment 0 and hot read on segment 1
+        let records = log.read(0, 8192).unwrap();
+        assert_eq!(records.len(), 10);
+
+        // Verify MMR inclusion proof for a record in the cold segment (segment 0)
+        let proof_seg0 = log.generate_inclusion_proof(2).expect("proof for offset 2 must exist");
+        assert_eq!(proof_seg0.leaf_index, 2);
+        assert!(proof_seg0.verify(&log.segments[0].mmr_root()));
+
+        // Verify MMR inclusion proof for a record in the active segment (segment 1)
+        let proof_seg1 = log.generate_inclusion_proof(7).expect("proof for offset 7 must exist");
+        assert_eq!(proof_seg1.leaf_index, 2); // 7 - base_offset(5) = 2
+        assert!(proof_seg1.verify(&log.segments[1].mmr_root()));
+
+        // Out of range proof returns None
+        assert!(log.generate_inclusion_proof(99).is_none());
+    }
 }
+
 
