@@ -31,3 +31,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.10"
 chacha20poly1305 = "0.10"
 libc = "0.2"
+getrandom = "0.2"
+ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
