@@ -6,6 +6,7 @@ members = [
     "crates/vortex-protocol",
     "crates/vortex-server",
     "crates/vortex-cli",
+    "crates/vortex-ffi",
 ]
 resolver = "2"
 
