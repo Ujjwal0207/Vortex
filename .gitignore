@@ -30,6 +30,10 @@ VORTEX_FLAWS_AND_VULNERABILITIES.md
 *flaws*.md
 *VULNERABILITIES*.md
 *vulnerabilities*.md
+UNIQUENESS.md
+UNIQUENESS*.md
+*uniqueness*.md
+*UNIQUENESS*.md
 docs/
 docs/*
 
@@ -42,6 +46,10 @@ Cargo.lock.backup
 data/
 *.vtx
 *.log
+*.keyring*
+*.wit
+*.zkp
+receipts/
 
 # macOS System Files
 .DS_Store
