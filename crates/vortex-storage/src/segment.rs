@@ -924,12 +924,17 @@ mod tests {
         for offset in [100, 105, 110, 119] {
             let proof = seg.generate_inclusion_proof(offset).expect("proof must exist");
             assert_eq!(proof.leaf_index, offset - 100);
-            assert!(proof.verify(&root), "proof must verify against segment MMR root");
+            assert!(proof.verify(&root, &proof.leaf_hash), "proof must verify against segment MMR root");
 
-            // Corrupting root or leaf fails
+            // Negative test: verify with mismatched leaf hash fails
+            let mut bad_leaf = proof.leaf_hash;
+            bad_leaf[0] ^= 0xFF;
+            assert!(!proof.verify(&root, &bad_leaf), "proof must fail with mismatched leaf");
+
+            // Corrupting root fails
             let mut bad_root = root;
             bad_root[0] ^= 0xFF;
-            assert!(!proof.verify(&bad_root));
+            assert!(!proof.verify(&bad_root, &proof.leaf_hash));
         }
 
         // Out of bounds proof returns None
@@ -947,7 +952,7 @@ mod tests {
         assert_eq!(reopened.mmr.count(), 20);
         assert_eq!(reopened.mmr_root(), root);
         let proof = reopened.generate_inclusion_proof(105).unwrap();
-        assert!(proof.verify(&root));
+        assert!(proof.verify(&root, &proof.leaf_hash));
     }
 }
 
