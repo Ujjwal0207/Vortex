@@ -5,7 +5,11 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-use vortex_core::{error::Result, record::{Record, RECORD_HEADER_SIZE}, HashDigest, VortexError};
+use vortex_core::{
+    error::Result,
+    record::{Record, RECORD_HEADER_SIZE},
+    HashDigest, MerkleMountainRange, MmrInclusionProof, VortexError,
+};
 
 /// 64 KB pre-allocated header and sparse index region.
 pub const HEADER_INDEX_REGION_SIZE: u64 = 65_536;
@@ -19,6 +23,39 @@ const COMMIT_STATE_SIZE: usize = 60;
 
 /// Sparse index checkpoint interval in bytes (record one index entry every 64 KB of data).
 pub const SPARSE_INDEX_INTERVAL_BYTES: u64 = 64 * 1024;
+
+/// Cache retention policy for segment reads to prevent cold consumer page-cache pollution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Hot tail reads: keep pages in OS page cache.
+    Hot,
+    /// Cold historical reads: advise the kernel to discard pages after read.
+    ColdDropCache,
+}
+
+#[cfg(unix)]
+fn advise_cache_policy(file: &File, _offset: u64, _len: u64, policy: CachePolicy) {
+    use std::os::unix::io::AsRawFd;
+    if policy == CachePolicy::ColdDropCache {
+        let fd = file.as_raw_fd();
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::posix_fadvise(
+                fd,
+                _offset as libc::off_t,
+                _len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::fcntl(fd, libc::F_NOCACHE, 1);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn advise_cache_policy(_file: &File, _offset: u64, _len: u64, _policy: CachePolicy) {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexEntry {
@@ -38,6 +75,7 @@ pub struct Segment {
     pub index_entries: Vec<IndexEntry>,
     pub current_data_position: u64,
     pub bytes_since_last_index: u64,
+    pub mmr: MerkleMountainRange,
     commit_path: PathBuf,
     poisoned: bool,
 }
@@ -100,6 +138,7 @@ impl Segment {
                 index_entries: Vec::new(),
                 current_data_position: HEADER_INDEX_REGION_SIZE,
                 bytes_since_last_index: 0,
+                mmr: MerkleMountainRange::new(),
                 commit_path,
                 poisoned: false,
             })
@@ -178,6 +217,7 @@ impl Segment {
         let mut last_hash = genesis_hash;
         let mut index_entries = Vec::new();
         let mut last_indexed_pos = HEADER_INDEX_REGION_SIZE;
+        let mut mmr = MerkleMountainRange::new();
 
         while curr_pos < scan_end {
             if scan_end - curr_pos < 4 {
@@ -236,6 +276,8 @@ impl Segment {
                 });
             }
 
+            mmr.append(rec.record_hash);
+
             if index_entries.is_empty()
                 || curr_pos.saturating_sub(last_indexed_pos) >= SPARSE_INDEX_INTERVAL_BYTES
             {
@@ -282,6 +324,7 @@ impl Segment {
             index_entries,
             current_data_position: curr_pos,
             bytes_since_last_index,
+            mmr,
             commit_path,
             poisoned: false,
         };
@@ -420,6 +463,9 @@ impl Segment {
         }
 
         // Now that physical disk write succeeded, commit in-memory state
+        for rec in &staged_records {
+            self.mmr.append(rec.record_hash);
+        }
         self.index_entries.extend(new_index_entries);
         self.current_data_position = curr_pos;
         self.bytes_since_last_index = bytes_since_last_index;
@@ -458,10 +504,24 @@ impl Segment {
             .map_err(|e| VortexError::Io(e.to_string()))
     }
 
-    /// Reads records starting from the given offset up to `max_bytes`.
-    /// Operates purely with positional reads (`read_exact_at`), taking `&self` to allow
-    /// unlimited concurrent readers without mutex contention (Flaw 2.1).
+    /// Reads records starting from the given offset up to `max_bytes` with default hot cache policy.
     pub fn read(&self, start_offset: u64, max_bytes: usize) -> Result<Vec<Record>> {
+        self.read_with_policy(start_offset, max_bytes, CachePolicy::Hot)
+    }
+
+    /// Reads records with cold cache policy, advising the kernel to drop read pages
+    /// from page cache immediately to prevent page cache pollution (Flaw 6.3).
+    pub fn read_cold(&self, start_offset: u64, max_bytes: usize) -> Result<Vec<Record>> {
+        self.read_with_policy(start_offset, max_bytes, CachePolicy::ColdDropCache)
+    }
+
+    /// Reads records starting from the given offset up to `max_bytes` under the specified cache policy.
+    pub fn read_with_policy(
+        &self,
+        start_offset: u64,
+        max_bytes: usize,
+        policy: CachePolicy,
+    ) -> Result<Vec<Record>> {
         if start_offset < self.base_offset || start_offset >= self.next_offset {
             return Ok(Vec::new());
         }
@@ -497,7 +557,23 @@ impl Segment {
             curr_pos += full_record_len as u64;
         }
 
+        advise_cache_policy(&self.file, start_pos, curr_pos.saturating_sub(start_pos), policy);
+
         Ok(records)
+    }
+
+    /// Returns the current Merkle Mountain Range bagged root of the segment.
+    pub fn mmr_root(&self) -> HashDigest {
+        self.mmr.root()
+    }
+
+    /// Generates an O(log N) cryptographic inclusion proof for the record at `offset`.
+    pub fn generate_inclusion_proof(&self, offset: u64) -> Option<MmrInclusionProof> {
+        if offset < self.base_offset || offset >= self.next_offset {
+            return None;
+        }
+        let leaf_index = offset - self.base_offset;
+        self.mmr.generate_proof(leaf_index)
     }
 
     /// Performs binary search over the sparse index to locate the closest physical file offset.
@@ -828,4 +904,50 @@ mod tests {
         assert_eq!(records[0].value.as_ref(), b"valid-record-1");
         assert_eq!(records[1].value.as_ref(), b"valid-record-2");
     }
+
+    #[test]
+    fn test_segment_mmr_inclusion_proof_and_cold_reads() {
+        let dir = tempdir().unwrap();
+        let genesis = compute_genesis_hash("mmr-segment-test", 0);
+        let mut seg = Segment::open_or_create(dir.path(), 100, genesis).unwrap();
+
+        for i in 0..20 {
+            let val = format!("message-payload-{}", i);
+            seg.append(None, Bytes::from(val)).unwrap();
+        }
+
+        assert_eq!(seg.mmr.count(), 20);
+        let root = seg.mmr_root();
+        assert_ne!(root, [0u8; 32]);
+
+        // Generate and verify inclusion proofs for various offsets
+        for offset in [100, 105, 110, 119] {
+            let proof = seg.generate_inclusion_proof(offset).expect("proof must exist");
+            assert_eq!(proof.leaf_index, offset - 100);
+            assert!(proof.verify(&root), "proof must verify against segment MMR root");
+
+            // Corrupting root or leaf fails
+            let mut bad_root = root;
+            bad_root[0] ^= 0xFF;
+            assert!(!proof.verify(&bad_root));
+        }
+
+        // Out of bounds proof returns None
+        assert!(seg.generate_inclusion_proof(99).is_none());
+        assert!(seg.generate_inclusion_proof(120).is_none());
+
+        // Cold read test: exercises page cache bypass without error
+        let cold_records = seg.read_cold(105, 4096).unwrap();
+        assert!(!cold_records.is_empty());
+        assert_eq!(cold_records[0].offset, 105);
+
+        // Reopening segment rebuilds MMR identically
+        drop(seg);
+        let reopened = Segment::open_or_create(dir.path(), 100, genesis).unwrap();
+        assert_eq!(reopened.mmr.count(), 20);
+        assert_eq!(reopened.mmr_root(), root);
+        let proof = reopened.generate_inclusion_proof(105).unwrap();
+        assert!(proof.verify(&root));
+    }
 }
+
