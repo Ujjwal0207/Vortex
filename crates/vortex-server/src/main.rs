@@ -9,10 +9,12 @@ mod bridge;
 mod connection;
 mod coordinator;
 mod engine;
+mod reactor;
 
 use connection::handle_connection;
 use coordinator::ConsumerGroupCoordinator;
 use engine::Engine;
+pub use reactor::PartitionAffinityRouter;
 
 #[derive(Parser, Debug)]
 #[command(name = "vortex-server", version = "0.1.0", about = "Vortex Next-Gen Event Streaming Broker")]
