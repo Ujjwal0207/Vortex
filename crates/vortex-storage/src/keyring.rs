@@ -47,6 +47,19 @@ impl TwoSlotKeyring {
         partition_id: u32,
         initial_offset: u64,
     ) -> Result<Self> {
+        let genesis_seed = ForwardSecureRatchet::generate_random_genesis_seed(topic, partition_id)?;
+        Self::open_or_create_with_seed(partition_dir, topic, partition_id, initial_offset, genesis_seed)
+    }
+
+    /// Opens an existing keyring or initializes a new one with an explicit secret genesis seed.
+    /// Useful for testing, deterministic replication, and escrowed audit verification.
+    pub fn open_or_create_with_seed(
+        partition_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+        initial_offset: u64,
+        genesis_seed: [u8; 32],
+    ) -> Result<Self> {
         let path_a = partition_dir.join(KEYRING_SLOT_A);
         let path_b = partition_dir.join(KEYRING_SLOT_B);
         let macs_path = partition_dir.join(PARTITION_MACS_FILE);
@@ -94,10 +107,7 @@ impl TwoSlotKeyring {
                 ActiveSlot::SlotB,
             ),
             (None, None) => {
-                // Initialize slot A with deterministic genesis seed derived from partition identity
-                let genesis_salt = b"VORTEX_KEYRING_GENESIS_SALT_V1.00";
-                let genesis_seed =
-                    ForwardSecureRatchet::derive_genesis_seed(topic, partition_id, genesis_salt);
+                // Initialize slot A with the secret genesis seed
                 let mut ratchet = ForwardSecureRatchet::new(genesis_seed);
                 if initial_offset > 0 {
                     ratchet.step(initial_offset);
@@ -340,5 +350,45 @@ mod tests {
         let recovered = TwoSlotKeyring::open_or_create(dir.path(), topic, partition).unwrap();
         assert_eq!(recovered.current_offset(), 1);
         assert_eq!(recovered.sequence(), 2);
+    }
+
+    #[test]
+    fn test_keyring_genesis_seed_unforgeable_and_escrow_replay() {
+        let dir = tempdir().unwrap();
+        let topic = "financial-ledger";
+        let partition = 0;
+
+        // Attacker attempts to forge MAC by deriving seed using only public inputs (topic, partition)
+        // and an old public constant or guess
+        let public_guess_salt = [0u8; 32];
+        let attacker_seed = ForwardSecureRatchet::derive_genesis_seed(topic, partition, &public_guess_salt);
+        let mut attacker_ratchet = ForwardSecureRatchet::new(attacker_seed);
+
+        // Legitimate keyring is opened with random CSPRNG genesis seed
+        let dir_legit = dir.path().join("legit");
+        std::fs::create_dir_all(&dir_legit).unwrap();
+        let mut keyring = TwoSlotKeyring::open_or_create(&dir_legit, topic, partition).unwrap();
+
+        let record_0 = b"genesis settlement payload";
+        let legit_mac = keyring.step_and_authenticate(record_0, 1).unwrap();
+        let attacker_mac = attacker_ratchet.compute_mac(record_0);
+
+        // Attacker's computed MAC does NOT match the legitimate forward-secure MAC
+        assert_ne!(legit_mac, attacker_mac, "attacker without secret CSPRNG seed cannot forge MAC");
+
+        // Escrow replay test: when created with known seed, legitimate escrow party CAN replay
+        let escrow_seed = [0x77u8; 32];
+        let dir_escrow = dir.path().join("escrow");
+        std::fs::create_dir_all(&dir_escrow).unwrap();
+        let mut escrow_keyring =
+            TwoSlotKeyring::open_or_create_with_seed(&dir_escrow, topic, partition, 0, escrow_seed).unwrap();
+
+        let test_rec = b"escrow verified record";
+        let mac_from_keyring = escrow_keyring.step_and_authenticate(test_rec, 1).unwrap();
+
+        // Escrow verifier replays ratchet from the known seed
+        let mut verifier_ratchet = ForwardSecureRatchet::new(escrow_seed);
+        let expected_mac = verifier_ratchet.compute_mac(test_rec);
+        assert_eq!(mac_from_keyring, expected_mac, "escrow replay matches keyring authentication");
     }
 }
