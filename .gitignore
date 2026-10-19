@@ -44,12 +44,33 @@ Cargo.lock.backup
 
 # Runtime Data & Storage
 data/
+demo_output/
+agent_demo_output/
+court_bundle/
+court_bundles/
+receipts/
+checkpoints/
 *.vtx
 *.log
+*.commit
+*.macs
 *.keyring*
 *.wit
 *.zkp
-receipts/
+*.vtxarc
+*.vtxanchor
+*.anchor.tmp
+*.wal
+*.wal.tmp
+*.jsonl
+witness_state.json
+
+# C / Native FFI Shared Libraries
+*.so
+*.dylib
+*.dll
+*.a
+*.o
 
 # macOS System Files
 .DS_Store
@@ -57,7 +78,7 @@ receipts/
 .Spotlight-V100
 .Trashes
 
-# Python Virtual Environments & Bytecode (for client SDK)
+# Python Virtual Environments, Bytecode & Testing Caches
 __pycache__/
 *.py[cod]
 *$py.class
@@ -67,17 +88,28 @@ env/
 dist/
 build/
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.whl
 
 # IDE & Editor Scratch Files
 .vscode/
 .idea/
+.cursor/
+.cursorrules
+.zed/
 *.swp
 *.swo
 *~
 
-# Environment & Secrets
+# Environment, Secrets & Cryptographic Keys
 .env
 .env.*
+*.seed
+*.pem
+*.key
+*.crt
 
 # Local Phase 7 review notes
 /PHASE_7_CURE_PLAN_2026-10-18.md
