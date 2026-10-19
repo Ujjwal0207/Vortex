@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 
+mod agent_demo;
 mod bench;
 mod client;
 
@@ -101,6 +102,33 @@ enum Commands {
 
         #[arg(short, long, default_value = "Patient medical record: diagnosis=confidential")]
         payload: String,
+    },
+
+    /// Run an end-to-end demonstration of the Autonomous Action Verifiable Evidence Pipeline
+    AgentDemo {
+        #[arg(short, long, default_value = "./agent_demo_output")]
+        output_dir: std::path::PathBuf,
+    },
+
+    /// Perform a zero-trust offline audit of an evidence directory or court bundle
+    VerifyEvidence {
+        #[arg(short = 'd', long, default_value = "./demo_output/court_bundle")]
+        data_dir: std::path::PathBuf,
+
+        #[arg(short = 't', long, default_value = "agent-audit")]
+        topic: String,
+
+        #[arg(short = 'p', long, default_value_t = 0)]
+        partition: u32,
+
+        #[arg(short = 'r', long)]
+        receipts: Option<std::path::PathBuf>,
+
+        #[arg(short = 'w', long)]
+        witness_reel: Option<std::path::PathBuf>,
+
+        #[arg(short = 'k', long)]
+        pubkeys: Option<std::path::PathBuf>,
     },
 }
 
@@ -298,6 +326,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::AgentDemo { output_dir } => {
+            agent_demo::run_agent_evidence_demo(&output_dir)?;
+        }
+        Commands::VerifyEvidence {
+            data_dir,
+            topic,
+            partition,
+            receipts,
+            witness_reel,
+            pubkeys,
+        } => {
+            let receipts_path = receipts.unwrap_or_else(|| data_dir.join("receipts.jsonl"));
+            let witness_reel_path = witness_reel.unwrap_or_else(|| data_dir.join("reel.wit"));
+            let pubkeys_path = pubkeys.unwrap_or_else(|| data_dir.join("pubkeys.toml"));
+
+            if !pubkeys_path.exists() {
+                return Err(format!("pubkeys.toml not found at {:?}. Please specify --pubkeys.", pubkeys_path).into());
+            }
+
+            let pubkeys_str = std::fs::read_to_string(&pubkeys_path)?;
+            let mut gw_pubkey = [0u8; 32];
+            let mut wit_pubkey = [0u8; 32];
+            let mut genesis_seed = None;
+            let mut in_gateway = false;
+            let mut in_witness = false;
+
+            for line in pubkeys_str.lines() {
+                let trimmed = line.trim();
+                if trimmed == "[gateway]" {
+                    in_gateway = true;
+                    in_witness = false;
+                } else if trimmed == "[witness]" {
+                    in_gateway = false;
+                    in_witness = true;
+                } else if trimmed.starts_with("pubkey = \"") {
+                    let hex_val = trimmed.trim_start_matches("pubkey = \"").trim_end_matches('"');
+                    let mut b = [0u8; 32];
+                    if let Ok(()) = hex::decode_32(hex_val, &mut b) {
+                        if in_gateway {
+                            gw_pubkey = b;
+                        } else if in_witness {
+                            wit_pubkey = b;
+                        }
+                    }
+                } else if trimmed.starts_with("genesis_seed = \"") {
+                    let hex_val = trimmed.trim_start_matches("genesis_seed = \"").trim_end_matches('"');
+                    let mut b = [0u8; 32];
+                    if let Ok(()) = hex::decode_32(hex_val, &mut b) {
+                        genesis_seed = Some(b);
+                    }
+                }
+            }
+
+            println!("🔍 Executing Zero-Trust Offline Verification for '{}:{}'...", topic, partition);
+            let report = vortex_storage::OfflineVerifier::verify(
+                &data_dir,
+                &topic,
+                partition,
+                genesis_seed,
+                &receipts_path,
+                &witness_reel_path,
+                gw_pubkey,
+                wit_pubkey,
+            )?;
+            report.print_summary();
+        }
     }
 
     Ok(())
@@ -309,5 +403,16 @@ mod hex {
     }
     pub fn encode_bytes(data: &[u8]) -> String {
         data.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+    pub fn decode_32(hex_str: &str, out: &mut [u8; 32]) -> Result<(), String> {
+        let clean = hex_str.trim();
+        if clean.len() != 64 {
+            return Err(format!("expected 64 hex characters, got {}", clean.len()));
+        }
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
