@@ -1,5 +1,5 @@
 use crate::hash::HashDigest;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+pub use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 /// 64-byte Ed25519 signature wrapper with hex serialization.
