@@ -55,8 +55,8 @@ impl TwoSlotKeyring {
     /// Useful for testing, deterministic replication, and escrowed audit verification.
     pub fn open_or_create_with_seed(
         partition_dir: &Path,
-        topic: &str,
-        partition_id: u32,
+        _topic: &str,
+        _partition_id: u32,
         initial_offset: u64,
         genesis_seed: [u8; 32],
     ) -> Result<Self> {
@@ -362,7 +362,7 @@ mod tests {
         // and an old public constant or guess
         let public_guess_salt = [0u8; 32];
         let attacker_seed = ForwardSecureRatchet::derive_genesis_seed(topic, partition, &public_guess_salt);
-        let mut attacker_ratchet = ForwardSecureRatchet::new(attacker_seed);
+        let attacker_ratchet = ForwardSecureRatchet::new(attacker_seed);
 
         // Legitimate keyring is opened with random CSPRNG genesis seed
         let dir_legit = dir.path().join("legit");
@@ -387,7 +387,7 @@ mod tests {
         let mac_from_keyring = escrow_keyring.step_and_authenticate(test_rec, 1).unwrap();
 
         // Escrow verifier replays ratchet from the known seed
-        let mut verifier_ratchet = ForwardSecureRatchet::new(escrow_seed);
+        let verifier_ratchet = ForwardSecureRatchet::new(escrow_seed);
         let expected_mac = verifier_ratchet.compute_mac(test_rec);
         assert_eq!(mac_from_keyring, expected_mac, "escrow replay matches keyring authentication");
     }
