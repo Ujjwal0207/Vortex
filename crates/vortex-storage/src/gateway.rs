@@ -159,12 +159,127 @@ impl PolicyEngine for SimplePolicyEngine {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AgentBudgetConfig {
+    pub max_ops_per_second: u32,
+    pub max_burst_ops: u32,
+    pub total_gas_limit: Option<u64>,
+}
+
+impl Default for AgentBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_ops_per_second: 50,
+            max_burst_ops: 100,
+            total_gas_limit: Some(1_000_000),
+        }
+    }
+}
+
+pub struct AgentBudgetGovernor {
+    pub default_config: AgentBudgetConfig,
+    agent_states: std::sync::Mutex<std::collections::HashMap<String, AgentBudgetState>>,
+}
+
+struct AgentBudgetState {
+    tokens: f64,
+    last_update_ns: u64,
+    consumed_gas: u64,
+    config: AgentBudgetConfig,
+}
+
+impl Default for AgentBudgetGovernor {
+    fn default() -> Self {
+        Self::new(AgentBudgetConfig::default())
+    }
+}
+
+impl AgentBudgetGovernor {
+    pub fn new(default_config: AgentBudgetConfig) -> Self {
+        Self {
+            default_config,
+            agent_states: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn set_agent_config(&mut self, agent_id: &str, config: AgentBudgetConfig) {
+        let mut states = self.agent_states.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let burst = config.max_burst_ops as f64;
+        states.insert(
+            agent_id.to_string(),
+            AgentBudgetState {
+                tokens: burst,
+                last_update_ns: now,
+                consumed_gas: 0,
+                config,
+            },
+        );
+    }
+
+    pub fn consume(&mut self, agent_id: &str, gas_cost: u64) -> Result<()> {
+        let mut states = self.agent_states.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let default_cfg = self.default_config.clone();
+        let state = states.entry(agent_id.to_string()).or_insert_with(|| {
+            let burst = default_cfg.max_burst_ops as f64;
+            AgentBudgetState {
+                tokens: burst,
+                last_update_ns: now,
+                consumed_gas: 0,
+                config: default_cfg,
+            }
+        });
+
+        // 1. Replenish tokens based on elapsed time
+        let elapsed_sec = (now.saturating_sub(state.last_update_ns) as f64) / 1_000_000_000.0;
+        state.last_update_ns = now;
+        state.tokens = (state.tokens + elapsed_sec * (state.config.max_ops_per_second as f64))
+            .min(state.config.max_burst_ops as f64);
+
+        // 2. Check rate limit tokens
+        if state.tokens < 1.0 {
+            return Err(VortexError::SecurityViolation {
+                reason: format!(
+                    "Rate limit exceeded for agent '{}': rate ceiling {} ops/s",
+                    agent_id, state.config.max_ops_per_second
+                ),
+            });
+        }
+
+        // 3. Check cumulative gas limit
+        if let Some(limit) = state.config.total_gas_limit {
+            if state.consumed_gas.saturating_add(gas_cost) > limit {
+                return Err(VortexError::SecurityViolation {
+                    reason: format!(
+                        "Gas budget exhausted for agent '{}': limit {}, attempted {}",
+                        agent_id, limit, state.consumed_gas + gas_cost
+                    ),
+                });
+            }
+        }
+
+        state.tokens -= 1.0;
+        state.consumed_gas += gas_cost;
+        Ok(())
+    }
+}
+
 /// Gateway write path managing agent action logging, policy enforcement,
 /// receipts emission, and signed checkpoint generation.
 pub struct ActionGateway {
     pub partition: PartitionLog,
     pub gateway_key: SigningKey,
     pub policy_engine: Box<dyn PolicyEngine>,
+    pub budget_governor: AgentBudgetGovernor,
     pub receipts_path: PathBuf,
     pub checkpoints_path: PathBuf,
     pub checkpoint_seq: u64,
@@ -184,6 +299,7 @@ impl ActionGateway {
             partition,
             gateway_key,
             policy_engine,
+            budget_governor: AgentBudgetGovernor::default(),
             receipts_path,
             checkpoints_path,
             checkpoint_seq: 0,
@@ -301,6 +417,10 @@ impl ActionGateway {
         action_id: &str,
         raw_args: &[u8],
     ) -> Result<(GatewayReceipt, PolicyDecision)> {
+        // Enforce rate limiter and gas budget governor
+        let gas_cost = (raw_args.len() as u64).max(10);
+        self.budget_governor.consume(agent_id, gas_cost)?;
+
         let req = ActionRequest::new(
             agent_id.to_string(),
             tool_name.to_string(),
