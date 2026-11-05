@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -45,6 +46,8 @@ pub struct PartitionLog {
     pub max_segment_bytes: u64,
     pub segments: Vec<Segment>,
     pub keyring: TwoSlotKeyring,
+    pub fd_pool: Arc<crate::fd_pool::FdPool>,
+    pub leader_epoch: u32,
 }
 
 impl PartitionLog {
@@ -55,7 +58,7 @@ impl PartitionLog {
         partition_id: u32,
         max_segment_bytes: u64,
     ) -> Result<Self> {
-        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, None)
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, None, None)
     }
 
     /// Opens an existing partition directory or initializes a new partition log with an explicit secret genesis seed.
@@ -67,7 +70,30 @@ impl PartitionLog {
         max_segment_bytes: u64,
         genesis_seed: [u8; 32],
     ) -> Result<Self> {
-        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, Some(genesis_seed))
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, Some(genesis_seed), None)
+    }
+
+    /// Opens an existing partition directory or initializes a new partition log with a shared FdPool.
+    pub fn open_or_create_with_pool(
+        base_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+        max_segment_bytes: u64,
+        fd_pool: Arc<crate::fd_pool::FdPool>,
+    ) -> Result<Self> {
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, None, Some(fd_pool))
+    }
+
+    /// Opens an existing partition directory or initializes a new partition log with seed and shared FdPool.
+    pub fn open_or_create_with_seed_and_pool(
+        base_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+        max_segment_bytes: u64,
+        genesis_seed: [u8; 32],
+        fd_pool: Arc<crate::fd_pool::FdPool>,
+    ) -> Result<Self> {
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, Some(genesis_seed), Some(fd_pool))
     }
 
     fn open_or_create_internal(
@@ -76,7 +102,9 @@ impl PartitionLog {
         partition_id: u32,
         max_segment_bytes: u64,
         genesis_seed: Option<[u8; 32]>,
+        fd_pool: Option<Arc<crate::fd_pool::FdPool>>,
     ) -> Result<Self> {
+        let fd_pool = fd_pool.unwrap_or_else(|| Arc::new(crate::fd_pool::FdPool::new(512)));
         let dir = base_dir.join(topic).join(format!("partition-{}", partition_id));
         fs::create_dir_all(&dir).map_err(|e| VortexError::Io(e.to_string()))?;
 
@@ -96,7 +124,8 @@ impl PartitionLog {
         if segment_files.is_empty() {
             // New partition: initialize with deterministic genesis root
             let genesis = compute_genesis_hash(topic, partition_id);
-            let active = Segment::open_or_create(&dir, 0, genesis)?;
+            let mut active = Segment::open_or_create(&dir, 0, genesis)?;
+            active.set_fd_pool(fd_pool.clone());
             segments.push(active);
         } else {
             // Load existing segments in sequence
@@ -178,12 +207,22 @@ impl PartitionLog {
 
             if segments.is_empty() {
                 let genesis = compute_genesis_hash(topic, partition_id);
-                let active = Segment::open_or_create(&dir, 0, genesis)?;
+                let mut active = Segment::open_or_create(&dir, 0, genesis)?;
+                active.set_fd_pool(fd_pool.clone());
                 segments.push(active);
+            } else {
+                let total_segs = segments.len();
+                for (i, seg) in segments.iter_mut().enumerate() {
+                    seg.set_fd_pool(fd_pool.clone());
+                    if i + 1 < total_segs {
+                        seg.seal();
+                    }
+                }
             }
         }
 
         let current_next_offset = segments.last().map_or(0, |s| s.next_offset);
+        let leader_epoch = segments.last().map_or(0, |s| s.leader_epoch);
         let keyring = match genesis_seed {
             Some(seed) => TwoSlotKeyring::open_or_create_with_seed(
                 &dir,
@@ -207,6 +246,8 @@ impl PartitionLog {
             max_segment_bytes,
             segments,
             keyring,
+            fd_pool,
+            leader_epoch,
         })
     }
 
@@ -299,18 +340,88 @@ impl PartitionLog {
     }
 
     /// Explicitly rolls the active segment, creating a new segment that inherits
-    /// the cryptographic tail hash of the current active segment.
+    /// the cryptographic tail hash of the current active segment and current leader epoch.
+    /// The rolled predecessor is sealed immediately to release its open file descriptor.
     pub fn roll_segment(&mut self) -> Result<()> {
         let active = self.active_segment_mut();
         active.flush()?;
+        active.seal();
 
         let next_base_offset = active.next_offset;
         let predecessor_tail_hash = active.last_record_hash;
 
-        let new_segment = Segment::open_or_create(&self.dir, next_base_offset, predecessor_tail_hash)?;
+        let mut new_segment = Segment::open_or_create_with_epoch(
+            &self.dir,
+            next_base_offset,
+            predecessor_tail_hash,
+            self.leader_epoch,
+        )?;
+        new_segment.set_fd_pool(self.fd_pool.clone());
         self.segments.push(new_segment);
 
         Ok(())
+    }
+
+    /// Returns the active monotonic leader epoch for this partition.
+    pub fn leader_epoch(&self) -> u32 {
+        self.leader_epoch
+    }
+
+    /// Advances the partition's leader epoch monotonically.
+    /// If `new_epoch <= self.leader_epoch`, rejects with `VortexError::FencedLeaderEpoch`.
+    pub fn advance_leader_epoch(&mut self, new_epoch: u32) -> Result<()> {
+        if new_epoch <= self.leader_epoch {
+            return Err(VortexError::FencedLeaderEpoch {
+                current: self.leader_epoch,
+                attempted: new_epoch,
+            });
+        }
+        self.leader_epoch = new_epoch;
+        let active = self.active_segment_mut();
+        active.set_leader_epoch(new_epoch)?;
+        Ok(())
+    }
+
+    /// Verifies that the client/coordinator epoch matches the active partition leader epoch.
+    pub fn verify_leader_epoch(&self, expected_epoch: u32) -> Result<()> {
+        if expected_epoch != self.leader_epoch {
+            return Err(VortexError::FencedLeaderEpoch {
+                current: self.leader_epoch,
+                attempted: expected_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    /// Appends an authenticated record with strict monotonic leader epoch verification,
+    /// protecting against zombie leader split-brain divergence.
+    pub fn append_authenticated_with_epoch(
+        &mut self,
+        key: Option<Bytes>,
+        value: Bytes,
+        epoch: u32,
+    ) -> Result<AppendResult> {
+        self.verify_leader_epoch(epoch)?;
+        self.append_authenticated(key, value)
+    }
+
+    /// Appends an atomic batch of records with strict monotonic leader epoch verification.
+    pub fn append_batch_authenticated_with_epoch(
+        &mut self,
+        batch: Vec<(Option<Bytes>, Bytes, Option<u64>)>,
+        epoch: u32,
+    ) -> Result<Vec<AppendResult>> {
+        self.verify_leader_epoch(epoch)?;
+        self.append_batch_authenticated(batch)
+    }
+
+    /// Explicitly seals the active segment, releasing its open file descriptor.
+    /// Future appends or reads will dynamically lease descriptors from the shared `fd_pool`.
+    pub fn seal_active_segment(&mut self) {
+        if let Some(active) = self.segments.last_mut() {
+            let _ = active.flush();
+            active.seal();
+        }
     }
 
     /// Reads records starting from `start_offset` across segments up to `max_bytes`.
@@ -563,7 +674,7 @@ impl PartitionLog {
             let should_prune_size = retention_bytes.map_or(false, |limit| total_size > limit);
             let should_prune_time = retention_ms.map_or(false, |limit_ms| {
                 let cutoff = now_ms.saturating_sub(limit_ms);
-                if let Ok(meta) = oldest_seg.file.metadata() {
+                if let Ok(meta) = oldest_seg.metadata() {
                     if let Ok(modified) = meta.modified() {
                         let dur = modified
                             .duration_since(std::time::UNIX_EPOCH)
@@ -606,6 +717,7 @@ impl PartitionLog {
                 remove_file_if_present(&path).map_err(|e| {
                     VortexError::Io(format!("failed to remove pruned segment file {:?}: {e}", path))
                 })?;
+                self.fd_pool.close(&path);
 
                 // Keep the segment available through its open descriptor, and in
                 // memory, until unlinking has been made durable.
