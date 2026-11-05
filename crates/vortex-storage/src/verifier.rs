@@ -110,6 +110,16 @@ impl OfflineVerifier {
                     ActionEvidenceRecord::Request(req) => {
                         requests.insert(req.action_id.clone(), req);
                     }
+                    ActionEvidenceRecord::CausalRequest(req) => {
+                        let standard_req = ActionRequest {
+                            action_id: req.action_id.clone(),
+                            agent_id: req.agent_id,
+                            tool_name: req.tool_name,
+                            args_commitment: req.args_commitment,
+                            timestamp_ns: req.timestamp_ns,
+                        };
+                        requests.insert(req.action_id, standard_req);
+                    }
                     ActionEvidenceRecord::Policy(pol) => {
                         policies.insert(pol.action_id.clone(), pol);
                     }
