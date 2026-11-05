@@ -24,12 +24,93 @@ impl PiiScanner {
     /// 4. PEM Encoded Private Keys (-----BEGIN ... PRIVATE KEY-----)
     /// 5. Credit Card Numbers (13-19 digits verified via Luhn algorithm)
     pub fn scan(&self, payload: &[u8], quarantine_on_detect: bool) -> PiiAction {
-        let text = match std::str::from_utf8(payload) {
-            Ok(t) => std::borrow::Cow::Borrowed(t),
-            Err(_) => String::from_utf8_lossy(payload),
-        };
+        let raw_text = String::from_utf8_lossy(payload);
+        let canonical = crate::canonicalizer::WireCanonicalizer::canonicalize(&raw_text);
+        let text = canonical.as_str();
 
-        // 1. AWS Key Detection: AKIA followed by 16 alphanumeric uppercase characters / digits
+        // 1. Anthropic API Keys (sk-ant-...)
+        if let Some(idx) = text.find("sk-ant-") {
+            let candidate = &text[idx..];
+            let end_idx = candidate
+                .find(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .unwrap_or(candidate.len());
+            let token_part = &candidate[..end_idx];
+            if token_part.len() >= 20 {
+                let reason = "Detected exposed Anthropic API Key ('sk-ant-...')".to_string();
+                return if quarantine_on_detect {
+                    PiiAction::Quarantine(reason)
+                } else {
+                    PiiAction::Mask(Bytes::from(text.replace(token_part, "[REDACTED_API_KEY]")))
+                };
+            }
+        }
+
+        // 2. OpenAI / LLM API Keys (sk-proj-..., sk-none-...)
+        if let Some(idx) = text.find("sk-proj-").or_else(|| text.find("sk-none-")) {
+            let candidate = &text[idx..];
+            let end_idx = candidate
+                .find(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .unwrap_or(candidate.len());
+            let token_part = &candidate[..end_idx];
+            if token_part.len() >= 20 {
+                let reason = "Detected exposed OpenAI / LLM Secret Key".to_string();
+                return if quarantine_on_detect {
+                    PiiAction::Quarantine(reason)
+                } else {
+                    PiiAction::Mask(Bytes::from(text.replace(token_part, "[REDACTED_API_KEY]")))
+                };
+            }
+        }
+
+        // 3. Google Cloud / Gemini API Keys (AIzaSy...)
+        if let Some(idx) = text.find("AIzaSy") {
+            let candidate = &text[idx..];
+            if candidate.len() >= 39 {
+                let token_part = &candidate[..39];
+                let reason = "Detected exposed Google Cloud / Gemini API Key ('AIzaSy...')".to_string();
+                return if quarantine_on_detect {
+                    PiiAction::Quarantine(reason)
+                } else {
+                    PiiAction::Mask(Bytes::from(text.replace(token_part, "[REDACTED_API_KEY]")))
+                };
+            }
+        }
+
+        // 4. Database Connection URIs (postgres://, mysql://, mongodb+srv://)
+        for db_prefix in &["postgres://", "mysql://", "mongodb+srv://", "mongodb://"] {
+            if let Some(idx) = text.find(db_prefix) {
+                let candidate = &text[idx..];
+                let end_idx = candidate
+                    .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '`')
+                    .unwrap_or(candidate.len());
+                let uri_part = &candidate[..end_idx];
+                let reason = format!("Detected exposed Database Connection URI ('{}...')", db_prefix);
+                return if quarantine_on_detect {
+                    PiiAction::Quarantine(reason)
+                } else {
+                    PiiAction::Mask(Bytes::from(text.replace(uri_part, "[REDACTED_DATABASE_URI]")))
+                };
+            }
+        }
+
+        // 5. JSON Web Tokens (eyJ...)
+        if let Some(idx) = text.find("eyJ") {
+            let candidate = &text[idx..];
+            let end_idx = candidate
+                .find(|c: char| !c.is_alphanumeric() && c != '.' && c != '-' && c != '_' && c != '=')
+                .unwrap_or(candidate.len());
+            let jwt_candidate = &candidate[..end_idx];
+            if jwt_candidate.len() >= 32 && jwt_candidate.matches('.').count() == 2 {
+                let reason = "Detected exposed JSON Web Token (JWT)".to_string();
+                return if quarantine_on_detect {
+                    PiiAction::Quarantine(reason)
+                } else {
+                    PiiAction::Mask(Bytes::from(text.replace(jwt_candidate, "[REDACTED_JWT_TOKEN]")))
+                };
+            }
+        }
+
+        // 6. AWS Key Detection: AKIA followed by 16 alphanumeric uppercase characters / digits
         if let Some(idx) = text.find("AKIA") {
             let candidate = &text[idx..];
             if candidate.len() >= 20 {
@@ -45,17 +126,17 @@ impl PiiScanner {
             }
         }
 
-        // 2. Private Key Detection
+        // 7. Private Key Detection
         if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
             let reason = "Detected exposed PEM Private Key".to_string();
             return if quarantine_on_detect {
                 PiiAction::Quarantine(reason)
             } else {
-                PiiAction::Mask(Bytes::from("[***REDACTED-PRIVATE-KEY***]"))
+                PiiAction::Mask(Bytes::from("[REDACTED_PRIVATE_KEY]"))
             };
         }
 
-        // 3. GitHub Tokens (ghp_, gho_, ghs_, ghr_)
+        // 8. GitHub Tokens (ghp_, gho_, ghs_, ghr_)
         for prefix in &["ghp_", "gho_", "ghs_", "ghr_"] {
             if let Some(idx) = text.find(prefix) {
                 let candidate = &text[idx..];
@@ -66,24 +147,10 @@ impl PiiScanner {
                         return if quarantine_on_detect {
                             PiiAction::Quarantine(reason)
                         } else {
-                            PiiAction::Mask(Bytes::from(text.replace(token_part, "[***REDACTED-GITHUB-TOKEN***]")))
+                            PiiAction::Mask(Bytes::from(text.replace(token_part, "[REDACTED_GITHUB_TOKEN]")))
                         };
                     }
                 }
-            }
-        }
-
-        // 4. OpenAI / AI Agent Tokens (sk-proj-...)
-        if let Some(idx) = text.find("sk-proj-") {
-            let candidate = &text[idx..];
-            if candidate.len() >= 20 {
-                let token_slice = &candidate[..20];
-                let reason = "Detected exposed OpenAI / LLM Secret Key ('sk-proj-...')".to_string();
-                return if quarantine_on_detect {
-                    PiiAction::Quarantine(reason)
-                } else {
-                    PiiAction::Mask(Bytes::from(text.replace(token_slice, "[***REDACTED-OPENAI-KEY***]")))
-                };
             }
         }
 
