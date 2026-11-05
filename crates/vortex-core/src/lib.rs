@@ -14,7 +14,7 @@ pub use blind_index::BlindIndexer;
 pub use error::{Result, VortexError};
 pub use evidence::{
     compute_commitment, generate_signing_key, verify_signature, ActionEvidenceRecord,
-    ActionRequest, ActionVerdict, ExecutorReceipt, GatewayReceipt, PolicyDecision, SignedCheckpoint,
+    ActionRequest, ActionVerdict, CausalActionRequest, ExecutorReceipt, GatewayReceipt, PolicyDecision, SignedCheckpoint,
     WitnessCountersignature, SignatureBytes, Signer, SigningKey,
 };
 pub use hash::{compute_genesis_hash, compute_record_hash, verify_record_integrity, HashDigest};
