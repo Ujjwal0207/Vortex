@@ -37,7 +37,11 @@ pub fn compute_record_hash(
     }
 
     hasher.update(&(value.len() as u32).to_be_bytes());
-    hasher.update(value);
+    if value.len() > 65_536 {
+        hasher.update_rayon(value);
+    } else {
+        hasher.update(value);
+    }
 
     *hasher.finalize().as_bytes()
 }
