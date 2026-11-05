@@ -12,6 +12,7 @@ pub struct ValidationConfig {
     pub reject_empty_payload: bool,
     pub scan_pii: bool,
     pub pii_quarantine: bool,
+    pub scan_prompt_injection: bool,
 }
 
 impl Default for ValidationConfig {
@@ -22,6 +23,7 @@ impl Default for ValidationConfig {
             reject_empty_payload: false,
             scan_pii: true,
             pii_quarantine: true,
+            scan_prompt_injection: false,
         }
     }
 }
@@ -76,7 +78,38 @@ impl IngressValidator {
             }
         }
 
-        // 2. Empty payload check
+        // 2. LLM Prompt Injection & Adversarial Delimiter Sanitizer
+        if self.config.scan_prompt_injection {
+            if let Ok(text) = std::str::from_utf8(value) {
+                let upper = text.to_uppercase();
+                const ADVERSARIAL_MARKERS: &[&str] = &[
+                    "<|IM_START|>",
+                    "<|IM_END|>",
+                    "<|SYSTEM|>",
+                    "<|USER|>",
+                    "<|ASSISTANT|>",
+                    "[INST]",
+                    "[/INST]",
+                    "<<SYS>>",
+                    "<</SYS>>",
+                    "SYSTEM OVERRIDE:",
+                    "IGNORE PREVIOUS INSTRUCTIONS",
+                ];
+
+                for marker in ADVERSARIAL_MARKERS {
+                    if upper.contains(marker) {
+                        return Err(VortexError::SecurityViolation {
+                            reason: format!(
+                                "Adversarial prompt injection marker detected: '{}'",
+                                marker
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 3. Empty payload check
         if self.config.reject_empty_payload && value.is_empty() {
             return Err(VortexError::PoisonPillDetected {
                 reason: "Empty payload rejected by topic policy".to_string(),
