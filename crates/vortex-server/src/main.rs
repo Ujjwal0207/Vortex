@@ -5,16 +5,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod bridge;
-mod connection;
-mod coordinator;
-mod engine;
-mod reactor;
-
-use connection::handle_connection;
-use coordinator::ConsumerGroupCoordinator;
-use engine::Engine;
-pub use reactor::PartitionAffinityRouter;
+use vortex_server::{handle_connection, ConsumerGroupCoordinator, Engine};
 
 #[derive(Parser, Debug)]
 #[command(name = "vortex-server", version = "0.1.0", about = "Vortex Next-Gen Event Streaming Broker")]
