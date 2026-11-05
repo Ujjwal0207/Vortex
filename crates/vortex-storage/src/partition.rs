@@ -517,6 +517,34 @@ impl PartitionLog {
         self.segments.last().and_then(|s| s.generate_consistency_proof(old_size))
     }
 
+    /// Returns the historical MMR root for a pruned segment covering `offset`, if archived in the anchor ledger.
+    pub fn get_pruned_anchor_root(&self, offset: u64) -> Option<vortex_core::HashDigest> {
+        let anchor_path = self.dir.join("pruned_peaks.anchor");
+        if !anchor_path.exists() {
+            return None;
+        }
+        let file = fs::File::open(&anchor_path).ok()?;
+        let reader = std::io::BufReader::new(file);
+        use std::io::BufRead;
+        for line in reader.lines().flatten() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                let base = val["base_offset"].as_u64()?;
+                let next = val["next_offset"].as_u64()?;
+                if offset >= base && offset < next {
+                    let root_arr = val["mmr_root"].as_array()?;
+                    if root_arr.len() == 32 {
+                        let mut root = [0u8; 32];
+                        for (r, v) in root.iter_mut().zip(root_arr) {
+                            *r = v.as_u64()? as u8;
+                        }
+                        return Some(root);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Prunes expired sealed segments based on size (retention_bytes) and time (retention_ms).
     /// The active segment is NEVER pruned to guarantee append continuity.
     /// Returns the list of pruned segment base offsets.
@@ -554,6 +582,21 @@ impl PartitionLog {
                 let base = seg.base_offset;
                 let path = seg.path.clone();
                 let commit_path = commit_state_path(&path);
+
+                // Persist MMR peak anchor for the pruned segment before unlinking,
+                // ensuring mathematical auditability survives physical disk reclamation
+                let anchor_path = self.dir.join("pruned_peaks.anchor");
+                let anchor_entry = serde_json::json!({
+                    "base_offset": seg.base_offset,
+                    "next_offset": seg.next_offset,
+                    "mmr_root": seg.mmr_root(),
+                    "peaks": seg.mmr.read().unwrap().peaks(),
+                });
+                if let Ok(mut anchor_file) = fs::OpenOptions::new().create(true).append(true).open(&anchor_path) {
+                    use std::io::Write;
+                    let _ = writeln!(anchor_file, "{}", anchor_entry);
+                    let _ = anchor_file.sync_data();
+                }
 
                 // Remove the marker before the data file. If data deletion then fails,
                 // the complete legacy segment remains recoverable by scanning it.
@@ -876,6 +919,12 @@ mod tests {
 
         let earliest = log.segments[0].base_offset;
         assert!(earliest > 0);
+
+        // Crucial: The MMR root for the pruned segment covering offset 0 must survive in the anchor ledger
+        assert!(
+            log.get_pruned_anchor_root(0).is_some(),
+            "Pruned segment covering offset 0 must have an archived MMR root in the anchor ledger"
+        );
 
         // Reading an offset prior to earliest must return OffsetOutOfRange error
         let err = log.read(0, 1024).unwrap_err();
