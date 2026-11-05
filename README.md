@@ -558,7 +558,7 @@ $$\text{leaf\_hash}_i = \text{Blake3}(\text{"vortex-mmr-leaf-v1"} \parallel i_{\
 
 ## 📊 Benchmarks & Performance
 
-Vortex includes comprehensive benchmarking tools designed to measure throughput, latency, and cryptographic overhead across all tiers of the system. The test suite is calibrated to run safely and deterministically on modern developer laptops without triggering thermal throttling, excessive SSD write wear, or memory bloat.
+Vortex includes comprehensive benchmarking tools designed to measure throughput, latency, cryptographic overhead, and enterprise durability across all tiers of the system. The test suite is calibrated to run safely and deterministically on modern developer laptops without triggering thermal throttling, excessive SSD write wear, or memory bloat.
 
 ### 1. Cryptographic & Zero-Knowledge Primitives (Pure CPU)
 
@@ -566,15 +566,16 @@ Measurements conducted on Apple Silicon (`rustc --release`) with isolated in-mem
 
 | Cryptographic Primitive | Latency | Throughput | Purpose |
 | :--- | :--- | :--- | :--- |
+| **Multi-Core Tree Hashing (Blake3 SIMD)** | **0.41 ms** / 2.0 MB | **~4,833 – 4,940 MB/s** | Parallel Rayon chunk tree hashing for large payloads |
 | **Blake3 Lineage Chaining** | **0.34 µs** / record | **~2,920,000 rec/s** | Record header serialization & tamper-evident chaining |
 | **Forward-Secure Ratchet Step + MAC** | **0.34 µs** / record | **~2,950,000 rec/s** | Ephemeral key derivation & historical tamper immunity |
 | **Total Ingress Cryptographic Overhead** | **0.68 µs** / record | **~1,470,000 rec/s** | Combined Blake3 chaining + ratchet MAC per message |
-| **Incremental MMR Leaf Insertion** | **0.45 µs** / leaf | **~2,235,000 leaves/s** | Dynamic peak recalculation & tree root updates |
-| **MMR Inclusion Proof Gen + Verify** | **2.56 µs** / proof | **~390,000 proofs/s** | Compact $O(\log N)$ tamper-evident inclusion validation |
-| **Zero-Knowledge Blind Indexing** | **0.13 µs** / tag | **~7,560,000 tags/s** | Salted deterministic blind index token derivation |
-| **Ephemeral Key Shredding** | **0.87 µs** / entity | **~1,150,000 ops/s** | ChaCha20-Poly1305 encryption & in-memory key zeroization |
+| **Incremental MMR Leaf Insertion** | **0.44 µs** / leaf | **~2,255,000 leaves/s** | Dynamic peak recalculation & tree root updates |
+| **MMR Inclusion Proof Gen + Verify** | **2.56 µs** / proof | **~391,000 proofs/s** | Compact $O(\log N)$ tamper-evident inclusion validation |
+| **Zero-Knowledge Blind Indexing** | **0.13 µs** / tag | **~7,770,000 tags/s** | Salted deterministic blind index token derivation |
+| **High-Cardinality Key Shredding** | **5.05 – 7.56 µs** / entity | **~132,000 – 197,800 ops/s** | 50,000 tenant keys group-committed WAL & 0.00% resurrection |
 | **Ed25519 Digital Signing** | **9.85 µs** / sign | **~101,500 signs/s** | Gateway action receipts & witness checkpoints |
-| **Ed25519 Signature Verification** | **19.65 µs** / verify | **~50,800 verifs/s** | Zero-trust offline verification of signed receipts |
+| **Ed25519 Signature Verification** | **19.51 µs** / verify | **~51,200 verifs/s** | Zero-trust offline verification of signed receipts |
 
 ---
 
@@ -585,8 +586,9 @@ Direct storage engine performance bypassing network sockets via the embeddable C
 | Operation | Workload | Latency / Commit | Throughput | Bandwidth |
 | :--- | :--- | :--- | :--- | :--- |
 | **Batched Sequential Append** | 10,000 records (chunk size 500) | **25.4 µs** / record | **39,344 rec/s** | 4.35 MB/s |
-| **Offline Verification Scan** | 10,000 records (CRC32 + Blake3 + MMR) | **3.2 µs** / record | **310,829 rec/s** | 35.8 MB/s |
-| **Physical Single-Commit Sync** | 20 individual atomic commits | **10.4 ms** / commit | ~96 commits/s | Atomic APFS fsync + `.commit` fence |
+| **Concurrent Reader Lag Catchup** | 8 parallel workers (10,000 records) | **93.0 ms** total | **~363,870 – 419,685 rec/s** | Parallel non-blocking catchup under heavy writer pressure |
+| **Offline Verification Scan** | 10,000 records (CRC32 + Blake3 + MMR) | **1.9 – 3.2 µs** / record | **310,000 – 526,000 rec/s** | 35.8 – 60.5 MB/s |
+| **Physical Single-Commit Sync** | 20 individual atomic commits | **10.4 – 11.1 ms** / commit | ~90 – 96 commits/s | Atomic APFS fsync + `.commit` fence |
 
 ---
 
@@ -598,7 +600,7 @@ End-to-end evidence capture and audit pipeline verifying continuous action seque
 | :--- | :--- | :--- | :--- | :--- |
 | **Gateway Action Ingestion** | 50 actions | 2,019 ms | **40.4 ms** / action | Request + Policy + Receipt (4 durable commits/action) |
 | **Witness Checkpoint & Countersign** | Tree size: 150 records | 11.0 ms | **11.0 ms** / checkpoint | Consistency check + monotonic Ed25519 countersignature |
-| **End-to-End Offline Court Audit** | 50 actions (150 log records) | 10.6 ms | **100% verified** | Validates log hash chain, ratchet MACs, receipts & witness reel |
+| **End-to-End Offline Court Audit** | 50 actions (150 log records) | 9.3 – 10.6 ms | **100% verified** | Validates log hash chain, ratchet MACs, receipts & witness reel |
 
 ---
 
@@ -615,11 +617,16 @@ Synchronous TCP streaming over loopback socket (`127.0.0.1:9092`) with full line
 
 ---
 
-### 5. Resource Footprint & Laptop Durability Profile
+### 5. Resource Footprint & Reliability Profile
 
 - **Binary Footprint:** Broker is `~2.5 MB`, CLI is `~1.5 MB`, embeddable `libvortex.dylib` is `~1.2 MB`.
 - **Memory RSS:** `6.7 – 6.9 MB` active memory usage during sustained streaming.
-- **Laptop-Friendly Testing:** The entire comprehensive benchmark (`cargo run --release --example bench_perf -p vortex-ffi`) finishes in under **4 seconds**, utilizing bounded temporary directories with automatic cleanup to prevent disk bloat and unnecessary SSD wear.
+- **Partition Hyperscaling (`FdPool`):** LRU descriptor pool caps active open OS file descriptors to $\le 64$ across 300+ active partition logs, eliminating OS `EMFILE` limits while maintaining sub-millisecond append latency.
+- **Monotonic Leader Fencing:** Hardened `LeaderEpoch` fencing rejects stale or zombie leader writes in sub-microsecond time with zero split-brain exposure.
+- **Instant Commit Recovery:** `CommitMarkerV2` fixed-length binary sidecars store MMR peak sets and epoch metadata for instant $O(1)$ startup recovery without historical log scanning.
+- **Deterministic Key Erasure:** 0.00% key resurrection across 50,000 shredded tenant keys on broker restart with sub-millisecond WAL replay.
+- **Bit-Rot & Tamper Quarantine:** Automated quarantine detects single bit-flips in historical segments and fences corrupted segments immediately.
+- **Laptop-Friendly Testing:** The comprehensive benchmark suite finishes in under **4 seconds**, utilizing bounded temporary directories with automatic cleanup to prevent disk bloat and unnecessary SSD wear.
 - **Crash Recovery:** Sudden `kill -9` during active ingestion recovers to the last valid commit marker with zero record duplication or torn tails.
 
 ---
@@ -630,7 +637,10 @@ Synchronous TCP streaming over loopback socket (`127.0.0.1:9092`) with full line
 # 1. Run the comprehensive in-process crypto, storage, and evidence benchmark (runs in ~4s):
 cargo run --release --example bench_perf -p vortex-ffi
 
-# 2. Run the network streaming benchmark against a live broker:
+# 2. Run the enterprise stress test & adversarial validation suite:
+cargo run --release --example enterprise_harsh_check -p vortex-ffi
+
+# 3. Run the network streaming benchmark against a live broker:
 ./target/release/vortex-server --data-dir ./data &
 ./target/release/vortex-cli bench --topic bench-stream --messages 50000 --size 512
 ```
@@ -656,7 +666,7 @@ crates/
 
 <div align="center">
 
-**Vortex** · Built with precision in Rust · All 98 workspace tests verified passing.
+**Vortex** · Built with precision in Rust · All 132 workspace tests verified passing.
 
 `cargo test --workspace`
 
