@@ -100,14 +100,18 @@ pub async fn handle_connection(
             }
         }
 
-        match reader.read_buf(&mut buffer).await {
-            Ok(0) => {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), reader.read_buf(&mut buffer)).await {
+            Ok(Ok(0)) => {
                 debug!("Client disconnected gracefully");
                 break;
             }
-            Ok(_) => {}
-            Err(e) => {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
                 error!("Socket read error: {}", e);
+                break;
+            }
+            Err(_) => {
+                debug!("Connection idle timeout reached (30s); closing connection");
                 break;
             }
         }
