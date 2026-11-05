@@ -20,8 +20,11 @@ pub const SEGMENT_VERSION: u8 = 1;
 pub const INDEX_ENTRY_SIZE: usize = 16;
 pub const MAX_INDEX_ENTRIES: usize = (HEADER_INDEX_REGION_SIZE as usize - 256) / INDEX_ENTRY_SIZE;
 const COMMIT_STATE_MAGIC: u32 = 0x5654_5843; // "VTXC"
+const COMMIT_STATE_MAGIC_V2: u32 = 0x5654_5832; // "VTX2"
 const COMMIT_STATE_VERSION: u8 = 1;
+const COMMIT_STATE_VERSION_2: u8 = 2;
 const COMMIT_STATE_SIZE: usize = 60;
+const COMMIT_STATE_V2_SIZE: usize = 2116;
 
 /// Sparse index checkpoint interval in bytes (record one index entry every 64 KB of data).
 pub const SPARSE_INDEX_INTERVAL_BYTES: u64 = 64 * 1024;
@@ -77,7 +80,7 @@ pub struct Segment {
     pub index_entries: Vec<IndexEntry>,
     pub current_data_position: u64,
     pub bytes_since_last_index: u64,
-    pub mmr: MerkleMountainRange,
+    pub mmr: std::sync::RwLock<MerkleMountainRange>,
     commit_path: PathBuf,
     poisoned: bool,
 }
@@ -127,6 +130,8 @@ impl Segment {
                 HEADER_INDEX_REGION_SIZE,
                 base_offset,
                 genesis_hash,
+                0,
+                &[],
             )?;
 
             Ok(Self {
@@ -140,7 +145,7 @@ impl Segment {
                 index_entries: Vec::new(),
                 current_data_position: HEADER_INDEX_REGION_SIZE,
                 bytes_since_last_index: 0,
-                mmr: MerkleMountainRange::new(),
+                mmr: std::sync::RwLock::new(MerkleMountainRange::new()),
                 commit_path,
                 poisoned: false,
             })
@@ -197,7 +202,7 @@ impl Segment {
         let commit_path = commit_state_path(&path);
         let commit_state = read_commit_state(&commit_path)?;
         let scan_end = match commit_state {
-            Some(state) => {
+            Some(ref state) => {
                 if state.end_position < HEADER_INDEX_REGION_SIZE || state.end_position > file_len {
                     return Err(VortexError::Io(format!(
                         "segment commit boundary {} is outside the data file (length {file_len})",
@@ -213,6 +218,83 @@ impl Segment {
             }
             None => file_len,
         };
+
+        if let Some(ref state) = commit_state {
+            if let Some((leaf_count, ref peaks)) = state.mmr_state {
+                let mmr = MerkleMountainRange::from_peaks(leaf_count, peaks.clone());
+
+                let mut index_count_buf = [0u8; 4];
+                let _ = file.read_exact_at(&mut index_count_buf, 252);
+                let index_count = u32::from_be_bytes(index_count_buf) as usize;
+                let count = index_count.min(MAX_INDEX_ENTRIES);
+                let mut fast_index_entries = Vec::with_capacity(count);
+
+                if count > 0 {
+                    let mut index_region_buf = vec![0u8; count * INDEX_ENTRY_SIZE];
+                    if file.read_exact_at(&mut index_region_buf, 256).is_ok() {
+                        for chunk in index_region_buf.chunks_exact(INDEX_ENTRY_SIZE) {
+                            let relative_offset = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
+                            let physical_position = u64::from_be_bytes(chunk[4..12].try_into().unwrap());
+                            let timestamp_delta = u32::from_be_bytes(chunk[12..16].try_into().unwrap());
+                            fast_index_entries.push(IndexEntry {
+                                relative_offset,
+                                physical_position,
+                                timestamp_delta,
+                            });
+                        }
+                    }
+                } else {
+                    let mut curr_pos = HEADER_INDEX_REGION_SIZE;
+                    let mut last_indexed_pos = curr_pos;
+                    let mut curr_offset = base_offset;
+                    while curr_pos < state.end_position {
+                        let mut len_buf = [0u8; 4];
+                        if file.read_exact_at(&mut len_buf, curr_pos).is_err() {
+                            break;
+                        }
+                        let total_len = u32::from_be_bytes(len_buf) as u64;
+                        if total_len < (RECORD_HEADER_SIZE - 4) as u64 {
+                            break;
+                        }
+                        if fast_index_entries.is_empty()
+                            || curr_pos.saturating_sub(last_indexed_pos) >= SPARSE_INDEX_INTERVAL_BYTES
+                        {
+                            let relative_offset = (curr_offset - base_offset) as u32;
+                            fast_index_entries.push(IndexEntry {
+                                relative_offset,
+                                physical_position: curr_pos,
+                                timestamp_delta: 0,
+                            });
+                            last_indexed_pos = curr_pos;
+                        }
+                        curr_pos += 4 + total_len;
+                        curr_offset += 1;
+                    }
+                    let count_u32 = fast_index_entries.len().min(MAX_INDEX_ENTRIES) as u32;
+                    let _ = file.write_all_at(&count_u32.to_be_bytes(), 252);
+                }
+
+                let mmap = unsafe { MmapOptions::new().map(&file).ok() };
+
+                return Ok(Self {
+                    base_offset,
+                    next_offset: state.next_offset,
+                    genesis_hash,
+                    last_record_hash: state.last_record_hash,
+                    path,
+                    commit_path,
+                    file,
+                    index_entries: fast_index_entries,
+                    current_data_position: state.end_position,
+                    bytes_since_last_index: 0,
+                    mmap,
+                    mmr: std::sync::RwLock::new(mmr),
+                    poisoned: false,
+                });
+            }
+        }
+
+        
 
         let mut curr_pos = HEADER_INDEX_REGION_SIZE;
         let mut next_offset = base_offset;
@@ -308,7 +390,7 @@ impl Segment {
                 )));
             }
         } else {
-            publish_commit_state(&path, &commit_path, curr_pos, next_offset, last_hash)?;
+            publish_commit_state(&path, &commit_path, curr_pos, next_offset, last_hash, mmr.count(), &mmr.peaks())?;
         }
 
         let bytes_since_last_index = curr_pos.saturating_sub(last_indexed_pos);
@@ -326,7 +408,7 @@ impl Segment {
             index_entries,
             current_data_position: curr_pos,
             bytes_since_last_index,
-            mmr,
+            mmr: std::sync::RwLock::new(mmr),
             commit_path,
             poisoned: false,
         };
@@ -445,12 +527,21 @@ impl Segment {
             return Err(error);
         }
 
+        let mut temp_mmr = self.mmr.read().unwrap().clone();
+        for rec in &staged_records {
+            temp_mmr.append(rec.record_hash);
+        }
+        let new_peaks = temp_mmr.peaks();
+        let new_leaf_count = temp_mmr.count();
+
         if let Err(error) = publish_commit_state(
             &self.path,
             &self.commit_path,
             curr_pos,
             curr_offset,
             curr_hash,
+            new_leaf_count,
+            &new_peaks,
         ) {
             self.poisoned = true;
             return Err(VortexError::Io(format!(
@@ -470,9 +561,7 @@ impl Segment {
         }
 
         // Now that physical disk write succeeded, commit in-memory state
-        for rec in &staged_records {
-            self.mmr.append(rec.record_hash);
-        }
+        *self.mmr.write().unwrap() = temp_mmr;
         self.index_entries.extend(new_index_entries);
         self.current_data_position = curr_pos;
         self.bytes_since_last_index = bytes_since_last_index;
@@ -571,7 +660,17 @@ impl Segment {
 
     /// Returns the current Merkle Mountain Range bagged root of the segment.
     pub fn mmr_root(&self) -> HashDigest {
-        self.mmr.root()
+        self.mmr.read().unwrap().root()
+    }
+
+    /// Returns the current Merkle Mountain Range leaf count.
+    pub fn mmr_count(&self) -> u64 {
+        self.mmr.read().unwrap().count()
+    }
+
+    /// Generates an MMR consistency proof for this segment.
+    pub fn generate_consistency_proof(&self, old_size: u64) -> Option<vortex_core::MmrConsistencyProof> {
+        self.mmr.read().unwrap().generate_consistency_proof(old_size)
     }
 
     /// Generates an O(log N) cryptographic inclusion proof for the record at `offset`.
@@ -580,7 +679,35 @@ impl Segment {
             return None;
         }
         let leaf_index = offset - self.base_offset;
-        self.mmr.generate_proof(leaf_index)
+        {
+            let mmr = self.mmr.read().unwrap();
+            if !mmr.needs_levels(leaf_index) {
+                return mmr.generate_proof(leaf_index);
+            }
+        }
+        self.rebuild_mmr_tree();
+        self.mmr.read().unwrap().generate_proof(leaf_index)
+    }
+
+    fn rebuild_mmr_tree(&self) {
+        let mut new_mmr = MerkleMountainRange::new();
+        let mut curr_pos = HEADER_INDEX_REGION_SIZE;
+        while curr_pos < self.current_data_position {
+            let mut len_buf = [0u8; 4];
+            if self.file.read_exact_at(&mut len_buf, curr_pos).is_err() {
+                break;
+            }
+            let total_len = u32::from_be_bytes(len_buf) as u64;
+            if total_len < (RECORD_HEADER_SIZE - 4) as u64 {
+                break;
+            }
+            let mut hash_buf = [0u8; 32];
+            if self.file.read_exact_at(&mut hash_buf, curr_pos + 56).is_ok() {
+                new_mmr.append(hash_buf);
+            }
+            curr_pos += 4 + total_len;
+        }
+        *self.mmr.write().unwrap() = new_mmr;
     }
 
     /// Reads raw record byte buffers starting from `start_offset` up to `max_bytes`
@@ -670,11 +797,12 @@ impl Segment {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CommitState {
     end_position: u64,
     next_offset: u64,
     last_record_hash: HashDigest,
+    mmr_state: Option<(u64, Vec<HashDigest>)>,
 }
 
 pub(crate) fn commit_state_path(segment_path: &Path) -> PathBuf {
@@ -691,26 +819,65 @@ fn read_commit_state(path: &Path) -> Result<Option<CommitState>> {
         Err(error) => return Err(VortexError::Io(format!("failed to open segment commit marker: {error}"))),
     };
     let length = file.metadata().map_err(|e| VortexError::Io(e.to_string()))?.len();
-    if length != COMMIT_STATE_SIZE as u64 {
-        return Err(VortexError::Io(format!("invalid segment commit marker length {length}")));
+    if length == COMMIT_STATE_V2_SIZE as u64 {
+        let mut bytes = [0u8; COMMIT_STATE_V2_SIZE];
+        std::io::Read::read_exact(&mut file, &mut bytes)
+            .map_err(|e| VortexError::Io(format!("failed to read segment commit marker: {e}")))?;
+        let magic = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let version = bytes[4];
+        let expected_crc = u32::from_be_bytes(bytes[2112..2116].try_into().unwrap());
+        if magic != COMMIT_STATE_MAGIC_V2
+            || version != COMMIT_STATE_VERSION_2
+            || crc32fast::hash(&bytes[..2112]) != expected_crc
+        {
+            return Err(VortexError::Io("invalid or corrupt segment commit marker".into()));
+        }
+        let peak_count = u16::from_be_bytes(bytes[6..8].try_into().unwrap()) as usize;
+        let end_position = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let next_offset = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let mut last_record_hash = [0u8; 32];
+        last_record_hash.copy_from_slice(&bytes[24..56]);
+        let mmr_leaf_count = u64::from_be_bytes(bytes[56..64].try_into().unwrap());
+
+        let mut mmr_peaks = Vec::with_capacity(peak_count);
+        for i in 0..peak_count.min(64) {
+            let start = 64 + i * 32;
+            let mut peak = [0u8; 32];
+            peak.copy_from_slice(&bytes[start..start + 32]);
+            mmr_peaks.push(peak);
+        }
+        Ok(Some(CommitState {
+            end_position,
+            next_offset,
+            last_record_hash,
+            mmr_state: Some((mmr_leaf_count, mmr_peaks)),
+        }))
+    } else if length == COMMIT_STATE_SIZE as u64 {
+        let mut bytes = [0u8; COMMIT_STATE_SIZE];
+        std::io::Read::read_exact(&mut file, &mut bytes)
+            .map_err(|e| VortexError::Io(format!("failed to read legacy segment commit marker: {e}")))?;
+        let magic = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let version = bytes[4];
+        let expected_crc = u32::from_be_bytes(bytes[56..60].try_into().unwrap());
+        if magic != COMMIT_STATE_MAGIC
+            || version != COMMIT_STATE_VERSION
+            || crc32fast::hash(&bytes[..56]) != expected_crc
+        {
+            return Err(VortexError::Io("invalid or corrupt segment commit marker".into()));
+        }
+        let end_position = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        let next_offset = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+        let mut last_record_hash = [0u8; 32];
+        last_record_hash.copy_from_slice(&bytes[24..56]);
+        Ok(Some(CommitState {
+            end_position,
+            next_offset,
+            last_record_hash,
+            mmr_state: None,
+        }))
+    } else {
+        Err(VortexError::Io(format!("invalid segment commit marker length {length}")))
     }
-    let mut bytes = [0u8; COMMIT_STATE_SIZE];
-    std::io::Read::read_exact(&mut file, &mut bytes)
-        .map_err(|e| VortexError::Io(format!("failed to read segment commit marker: {e}")))?;
-    let magic = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
-    let version = bytes[4];
-    let expected_crc = u32::from_be_bytes(bytes[56..60].try_into().unwrap());
-    if magic != COMMIT_STATE_MAGIC
-        || version != COMMIT_STATE_VERSION
-        || crc32fast::hash(&bytes[..56]) != expected_crc
-    {
-        return Err(VortexError::Io("invalid or corrupt segment commit marker".into()));
-    }
-    let end_position = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-    let next_offset = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
-    let mut last_record_hash = [0u8; 32];
-    last_record_hash.copy_from_slice(&bytes[24..56]);
-    Ok(Some(CommitState { end_position, next_offset, last_record_hash }))
 }
 
 fn publish_commit_state(
@@ -719,15 +886,26 @@ fn publish_commit_state(
     end_position: u64,
     next_offset: u64,
     last_record_hash: HashDigest,
+    mmr_leaf_count: u64,
+    mmr_peaks: &[HashDigest],
 ) -> Result<()> {
-    let mut bytes = [0u8; COMMIT_STATE_SIZE];
-    bytes[0..4].copy_from_slice(&COMMIT_STATE_MAGIC.to_be_bytes());
-    bytes[4] = COMMIT_STATE_VERSION;
+    let mut bytes = [0u8; COMMIT_STATE_V2_SIZE];
+    bytes[0..4].copy_from_slice(&COMMIT_STATE_MAGIC_V2.to_be_bytes());
+    bytes[4] = COMMIT_STATE_VERSION_2;
+    let peak_count = mmr_peaks.len().min(64) as u16;
+    bytes[6..8].copy_from_slice(&peak_count.to_be_bytes());
     bytes[8..16].copy_from_slice(&end_position.to_be_bytes());
     bytes[16..24].copy_from_slice(&next_offset.to_be_bytes());
     bytes[24..56].copy_from_slice(&last_record_hash);
-    let checksum = crc32fast::hash(&bytes[..56]);
-    bytes[56..60].copy_from_slice(&checksum.to_be_bytes());
+    bytes[56..64].copy_from_slice(&mmr_leaf_count.to_be_bytes());
+
+    for (i, peak) in mmr_peaks.iter().take(64).enumerate() {
+        let start = 64 + i * 32;
+        bytes[start..start + 32].copy_from_slice(peak);
+    }
+
+    let checksum = crc32fast::hash(&bytes[..2112]);
+    bytes[2112..2116].copy_from_slice(&checksum.to_be_bytes());
 
     let name = commit_path.file_name().expect("commit marker path has a filename");
     let mut temp_name = name.to_os_string();
@@ -981,7 +1159,7 @@ mod tests {
             seg.append(None, Bytes::from(val)).unwrap();
         }
 
-        assert_eq!(seg.mmr.count(), 20);
+        assert_eq!(seg.mmr_count(), 20);
         let root = seg.mmr_root();
         assert_ne!(root, [0u8; 32]);
 
@@ -1014,7 +1192,7 @@ mod tests {
         // Reopening segment rebuilds MMR identically
         drop(seg);
         let reopened = Segment::open_or_create(dir.path(), 100, genesis).unwrap();
-        assert_eq!(reopened.mmr.count(), 20);
+        assert_eq!(reopened.mmr_count(), 20);
         assert_eq!(reopened.mmr_root(), root);
         let proof = reopened.generate_inclusion_proof(105).unwrap();
         assert!(proof.verify(&root, &proof.leaf_hash));
