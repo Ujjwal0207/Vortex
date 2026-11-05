@@ -11,12 +11,18 @@ use vortex_protocol::{
     CreateTopicRequest, CreateTopicResponse, ErrorResponse, FetchRequest, FetchResponse, Frame,
     ProduceRequest, ProduceResponse,
 };
-use vortex_storage::{check_ingress_watermark, PartitionLog, DEFAULT_MAX_SEGMENT_BYTES};
+use vortex_storage::{check_ingress_watermark, AdaptiveLingerQueue, PartitionLog, DEFAULT_MAX_SEGMENT_BYTES};
+
+#[derive(Clone)]
+pub struct PartitionHandle {
+    pub log: Arc<RwLock<PartitionLog>>,
+    pub linger: AdaptiveLingerQueue,
+}
 
 pub struct Engine {
     data_dir: PathBuf,
     validator: IngressValidator,
-    partitions: RwLock<HashMap<(String, u32), Arc<RwLock<PartitionLog>>>>,
+    partitions: RwLock<HashMap<(String, u32), PartitionHandle>>,
     #[allow(dead_code)]
     pub reactor: crate::reactor::PartitionAffinityRouter,
 }
@@ -111,17 +117,14 @@ impl Engine {
             }
         };
 
-        // 2. Fetch or create partition log
+        // 2. Fetch or create partition log and submit via adaptive linger queue
         let partition = self.get_or_create_partition(&req.topic, req.partition).await?;
-        let mut log = partition.write().await;
-
-        // 3. Append to partition
-        let record = log.append(req.key, final_value)?;
+        let append_res = partition.linger.submit(req.key, final_value, None).await?;
 
         Ok(ProduceResponse {
-            offset: record.offset,
-            timestamp: record.timestamp,
-            record_hash: record.record_hash,
+            offset: append_res.record.offset,
+            timestamp: append_res.record.timestamp,
+            record_hash: append_res.record.record_hash,
         })
     }
 
@@ -155,7 +158,7 @@ impl Engine {
         }
 
         let partition = self.get_or_create_partition(topic, partition_id).await?;
-        let mut log = partition.write().await;
+        let mut log = partition.log.write().await;
         let records = log.append_batch(validated_records)?;
         let responses = records
             .into_iter()
@@ -170,7 +173,7 @@ impl Engine {
 
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse> {
         let partition = self.get_or_create_partition(&req.topic, req.partition).await?;
-        let log = partition.read().await;
+        let log = partition.log.read().await;
 
         let records = log.read(req.start_offset, req.max_bytes as usize)?;
         Ok(FetchResponse { records })
@@ -179,7 +182,7 @@ impl Engine {
     /// Returns retained and next offsets without reading record payloads.
     pub async fn partition_bounds(&self, topic: &str, partition_id: u32) -> Result<(u64, u64)> {
         let partition = self.get_or_create_partition(topic, partition_id).await?;
-        let log = partition.read().await;
+        let log = partition.log.read().await;
         Ok((log.earliest_offset(), log.next_offset()))
     }
 
@@ -194,8 +197,7 @@ impl Engine {
     async fn route_to_quarantine(&self, event: QuarantinedEvent) -> Result<()> {
         let quarantine_topic = format!("{}.__quarantine", event.topic);
         let partition = self.get_or_create_partition(&quarantine_topic, 0).await?;
-        let mut log = partition.write().await;
-        log.append(None, event.to_bytes())?;
+        let _ = partition.linger.submit(None, event.to_bytes(), None).await?;
         Ok(())
     }
 
@@ -203,21 +205,21 @@ impl Engine {
         &self,
         topic: &str,
         partition_id: u32,
-    ) -> Result<Arc<RwLock<PartitionLog>>> {
+    ) -> Result<PartitionHandle> {
         let key = (topic.to_string(), partition_id);
 
         // Fast path: concurrent read lock for existing partitions
         {
             let parts = self.partitions.read().await;
             if let Some(part) = parts.get(&key) {
-                return Ok(Arc::clone(part));
+                return Ok(part.clone());
             }
         }
 
         // Slow path: write lock to initialize and insert new partition log
         let mut parts = self.partitions.write().await;
         if let Some(part) = parts.get(&key) {
-            return Ok(Arc::clone(part));
+            return Ok(part.clone());
         }
 
         let log = PartitionLog::open_or_create(
@@ -228,8 +230,20 @@ impl Engine {
         )?;
 
         let shared = Arc::new(RwLock::new(log));
-        parts.insert(key, Arc::clone(&shared));
-        Ok(shared)
+        let linger = AdaptiveLingerQueue::from_shared(
+            Arc::clone(&shared),
+            std::time::Duration::from_millis(2),
+            1000,
+            64 * 1024,
+        );
+
+        let handle = PartitionHandle {
+            log: shared,
+            linger,
+        };
+
+        parts.insert(key, handle.clone());
+        Ok(handle)
     }
 
     fn error_frame(req_id: u32, code: u16, message: String) -> Frame {
