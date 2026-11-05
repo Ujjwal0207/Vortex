@@ -9,38 +9,24 @@ PHASE_*.md
 # Internal Benchmark & Stress Test Harnesses
 crates/vortex-ffi/examples/reality_check.rs
 crates/vortex-ffi/examples/enterprise_harsh_check.rs
-PHASE_3.md
-PHASE_4.md
-PHASE_5_MULTI_SERVER.md
-PHASE_6_SECURITY_PRIVACY_ADVANCED.md
-PHASE_7_KAFKA_GAP_CLOSURE_PLAN.md
+# Internal Specs, Notes & Architecture Docs
 PHASE*.md
-IMPLEMENTATION_PLAN.md
-implementation_plan.md
 *PLAN*.md
 *plan*.md
 rules.txt
-VORTEX_RULES.md
 *RULES*.md
 *rules*.md
 scripts/zero_regression.sh
-PROBLEMS_FACED.md
 PROBLEMS*.md
-USE_CASES_IN_MINI_X.md
 *USE_CASES*.md
-PROJECT_ARCHITECTURE_AND_CHAT_CROSS_QUESTIONS.md
-TECH_STACK_DEEP_DIVE_AND_100_INTERVIEW_QUESTIONS.md
 *CROSS_QUESTIONS*.md
 *INTERVIEW*.md
-VORTEX_FLAWS_AND_VULNERABILITIES.md
 *FLAWS*.md
 *flaws*.md
 *VULNERABILITIES*.md
 *vulnerabilities*.md
-UNIQUENESS.md
 UNIQUENESS*.md
 *uniqueness*.md
-*UNIQUENESS*.md
 docs/
 docs/*
 
