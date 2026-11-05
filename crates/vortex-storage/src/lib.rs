@@ -1,7 +1,9 @@
 pub mod batch_io;
 pub mod compaction;
+pub mod fd_pool;
 pub mod gateway;
 pub mod keyring;
+pub mod linger;
 pub mod partition;
 pub mod scrubber;
 pub mod segment;
@@ -14,8 +16,10 @@ pub use batch_io::{BatchedPositionalIo, BatchedWriteRequest};
 pub use compaction::{
     compute_state_merkle_root, deduplicate_records, ChangelogCompactor, CompactionAnchor,
 };
+pub use fd_pool::FdPool;
 pub use gateway::{ActionGateway, PolicyEngine, SimplePolicyEngine};
 pub use keyring::TwoSlotKeyring;
+pub use linger::AdaptiveLingerQueue;
 pub use partition::{AppendResult, PartitionLog, PartitionVerifyReport, DEFAULT_MAX_SEGMENT_BYTES};
 pub use scrubber::{ScrubReport, Scrubber};
 pub use segment::{IndexEntry, Segment, HEADER_INDEX_REGION_SIZE, SEGMENT_MAGIC};
