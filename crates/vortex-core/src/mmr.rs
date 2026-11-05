@@ -232,6 +232,55 @@ impl MerkleMountainRange {
         self.leaf_count
     }
 
+    /// Checks if this tree requires internal node reconstruction for proof generation.
+    pub fn needs_levels(&self, leaf_index: u64) -> bool {
+        if leaf_index >= self.leaf_count {
+            return false;
+        }
+        let mut remaining = leaf_index;
+        for peak in &self.peaks {
+            if remaining < peak.size as u64 {
+                return peak.size > 1 && peak.levels.len() <= 1;
+            }
+            remaining -= peak.size as u64;
+        }
+        false
+    }
+
+    /// Constructs an MmrTree from existing peak roots and leaf count in O(1) time.
+    pub fn from_peaks(leaf_count: u64, peaks: Vec<HashDigest>) -> Self {
+        let mut peak_sizes = Vec::new();
+        let mut n = leaf_count;
+        let mut bit = 63i32;
+        while n > 0 && bit >= 0 {
+            if (n & (1u64 << bit)) != 0 {
+                peak_sizes.push(1usize << bit);
+                n &= !(1u64 << bit);
+            }
+            if bit == 0 {
+                break;
+            }
+            bit -= 1;
+        }
+
+        let peak_objs = peaks
+            .into_iter()
+            .enumerate()
+            .map(|(i, root)| {
+                let size = peak_sizes.get(i).copied().unwrap_or(1);
+                MmrPeak {
+                    size,
+                    levels: vec![vec![root]],
+                }
+            })
+            .collect();
+
+        Self {
+            peaks: peak_objs,
+            leaf_count,
+        }
+    }
+
     /// Returns the current bagged root digest of the entire MMR.
     pub fn root(&self) -> HashDigest {
         let peak_hashes: Vec<HashDigest> = self.peaks.iter().map(|p| p.root()).collect();
