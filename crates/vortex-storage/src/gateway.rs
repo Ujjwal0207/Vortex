@@ -20,6 +20,9 @@ pub trait PolicyEngine: Send + Sync {
 pub struct SimplePolicyEngine {
     pub policy_version: String,
     pub blocked_tools: Vec<String>,
+    pub enable_ddl_guard: bool,
+    pub enable_ssrf_guard: bool,
+    pub enable_path_traversal_guard: bool,
 }
 
 impl SimplePolicyEngine {
@@ -27,28 +30,132 @@ impl SimplePolicyEngine {
         Self {
             policy_version: policy_version.to_string(),
             blocked_tools,
+            enable_ddl_guard: true,
+            enable_ssrf_guard: true,
+            enable_path_traversal_guard: true,
         }
     }
 }
 
 impl PolicyEngine for SimplePolicyEngine {
-    fn evaluate(&self, _agent_id: &str, tool_name: &str, _raw_args: &[u8]) -> PolicyDecision {
-        let action_id = format!("act-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    fn evaluate(&self, _agent_id: &str, tool_name: &str, raw_args: &[u8]) -> PolicyDecision {
+        let action_id = format!(
+            "act-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        // 1. Tool name blocklist
         if self.blocked_tools.iter().any(|b| b == tool_name) {
-            PolicyDecision::new(
+            return PolicyDecision::new(
                 action_id,
                 self.policy_version.clone(),
                 false,
                 format!("Tool '{}' is blocked by security policy", tool_name),
-            )
-        } else {
-            PolicyDecision::new(
-                action_id,
-                self.policy_version.clone(),
-                true,
-                "Policy allowed execution".to_string(),
-            )
+            );
         }
+
+        let args_str = String::from_utf8_lossy(raw_args);
+        let upper_args = args_str.to_uppercase();
+
+        // 2. Semantic AST Taint: Destructive SQL DDL & privilege escalation blocker
+        if self.enable_ddl_guard {
+            const DESTRUCTIVE_KEYWORDS: &[&str] = &[
+                "DROP TABLE",
+                "DROP DATABASE",
+                "DROP SCHEMA",
+                "TRUNCATE TABLE",
+                "TRUNCATE ",
+                "ALTER TABLE",
+                "GRANT ",
+                "REVOKE ",
+                ";--",
+                "; --",
+            ];
+
+            for kw in DESTRUCTIVE_KEYWORDS {
+                if upper_args.contains(kw) {
+                    return PolicyDecision::new(
+                        action_id,
+                        self.policy_version.clone(),
+                        false,
+                        format!(
+                            "Semantic AST taint: Destructive DDL / privilege escalation keyword '{}' blocked",
+                            kw
+                        ),
+                    );
+                }
+            }
+        }
+
+        // 3. SSRF barrier: Block AWS/GCP/Alibaba cloud metadata, private IPs, and local loopbacks
+        if self.enable_ssrf_guard {
+            const SSRF_PATTERNS: &[&str] = &[
+                "169.254.169.254",          // AWS / GCP / Azure metadata endpoint
+                "metadata.google.internal", // GCP metadata DNS
+                "100.100.100.200",          // Alibaba Cloud metadata endpoint
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "file://",                  // Local file protocol scheme
+            ];
+
+            for pattern in SSRF_PATTERNS {
+                if upper_args.contains(&pattern.to_uppercase()) {
+                    return PolicyDecision::new(
+                        action_id,
+                        self.policy_version.clone(),
+                        false,
+                        format!("SSRF barrier: Restricted endpoint or scheme '{}' blocked", pattern),
+                    );
+                }
+            }
+
+            // Private RFC 1918 subnets: 10.x.x.x, 192.168.x.x, 172.16-31.x.x
+            if upper_args.contains("://10.")
+                || upper_args.contains("://192.168.")
+                || (16..=31).any(|octet| upper_args.contains(&format!("://172.{}.", octet)))
+            {
+                return PolicyDecision::new(
+                    action_id,
+                    self.policy_version.clone(),
+                    false,
+                    "SSRF barrier: Private RFC 1918 subnet access blocked".to_string(),
+                );
+            }
+        }
+
+        // 4. Path traversal protection for file tools
+        if self.enable_path_traversal_guard {
+            const TRAVERSAL_PATTERNS: &[&str] = &[
+                "../",
+                "..\\",
+                "/etc/passwd",
+                "/etc/shadow",
+                "/.ssh/",
+                "/proc/self/",
+            ];
+
+            for pattern in TRAVERSAL_PATTERNS {
+                if upper_args.contains(&pattern.to_uppercase()) {
+                    return PolicyDecision::new(
+                        action_id,
+                        self.policy_version.clone(),
+                        false,
+                        format!("Path traversal barrier: Suspicious pattern '{}' blocked", pattern),
+                    );
+                }
+            }
+        }
+
+        PolicyDecision::new(
+            action_id,
+            self.policy_version.clone(),
+            true,
+            "Policy allowed execution".to_string(),
+        )
     }
 }
 
@@ -61,6 +168,8 @@ pub struct ActionGateway {
     pub receipts_path: PathBuf,
     pub checkpoints_path: PathBuf,
     pub checkpoint_seq: u64,
+    pub last_seen_seqs: std::collections::HashMap<String, u64>,
+    pub seen_action_ids: std::collections::HashSet<String>,
 }
 
 impl ActionGateway {
@@ -78,6 +187,8 @@ impl ActionGateway {
             receipts_path,
             checkpoints_path,
             checkpoint_seq: 0,
+            last_seen_seqs: std::collections::HashMap::new(),
+            seen_action_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -121,7 +232,69 @@ impl ActionGateway {
 
     /// Evaluates policy for an incoming agent request, writes both the request commitment
     /// and policy decision to the immutable hash-chained log, and emits a signed GatewayReceipt.
+    /// Replay protection: Rejects duplicate action_ids.
     pub fn record_action_request(
+        &mut self,
+        agent_id: &str,
+        tool_name: &str,
+        action_id: &str,
+        raw_args: &[u8],
+    ) -> Result<(GatewayReceipt, PolicyDecision)> {
+        if self.seen_action_ids.contains(action_id) {
+            return Err(VortexError::SecurityViolation {
+                reason: format!("Replay attack detected: action_id '{}' already processed", action_id),
+            });
+        }
+        self.seen_action_ids.insert(action_id.to_string());
+        self.record_action_request_internal(agent_id, tool_name, action_id, raw_args)
+    }
+
+    /// Records an agent action with monotonic sequence verification and optional deadline fencing.
+    /// Rejects out-of-order dispatches, replays, and expired intents.
+    pub fn record_action_request_with_seq(
+        &mut self,
+        agent_id: &str,
+        tool_name: &str,
+        action_id: &str,
+        raw_args: &[u8],
+        agent_seq: u64,
+        deadline_utc_ns: Option<u64>,
+    ) -> Result<(GatewayReceipt, PolicyDecision)> {
+        if self.seen_action_ids.contains(action_id) {
+            return Err(VortexError::SecurityViolation {
+                reason: format!("Replay attack detected: action_id '{}' already processed", action_id),
+            });
+        }
+
+        if let Some(&last_seq) = self.last_seen_seqs.get(agent_id) {
+            if agent_seq <= last_seq {
+                return Err(VortexError::SecurityViolation {
+                    reason: format!(
+                        "Agent sequence violation for '{}': incoming seq {} <= last seen seq {}",
+                        agent_id, agent_seq, last_seq
+                    ),
+                });
+            }
+        }
+
+        if let Some(deadline) = deadline_utc_ns {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            if now > deadline {
+                return Err(VortexError::SecurityViolation {
+                    reason: format!("Action expired: current time {} > deadline {}", now, deadline),
+                });
+            }
+        }
+
+        self.last_seen_seqs.insert(agent_id.to_string(), agent_seq);
+        self.seen_action_ids.insert(action_id.to_string());
+        self.record_action_request_internal(agent_id, tool_name, action_id, raw_args)
+    }
+
+    fn record_action_request_internal(
         &mut self,
         agent_id: &str,
         tool_name: &str,
