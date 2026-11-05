@@ -20,6 +20,7 @@ pub struct EntityKeyRegistry {
     active_keys: RwLock<HashMap<String, [u8; 32]>>,
     shredded_entities: RwLock<HashSet<String>>,
     wal_path: Option<PathBuf>,
+    wal_file: std::sync::Mutex<Option<File>>,
 }
 
 impl EntityKeyRegistry {
@@ -30,6 +31,7 @@ impl EntityKeyRegistry {
             active_keys: RwLock::new(HashMap::new()),
             shredded_entities: RwLock::new(HashSet::new()),
             wal_path: None,
+            wal_file: std::sync::Mutex::new(None),
         }
     }
 
@@ -49,17 +51,29 @@ impl EntityKeyRegistry {
             }
         }
 
+        let wal_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(wal_path)
+            .map_err(|e| VortexError::Io(e.to_string()))?;
+
         Ok(Self {
             master_key,
             active_keys: RwLock::new(HashMap::new()),
             shredded_entities: RwLock::new(shredded),
             wal_path: Some(wal_path.to_path_buf()),
+            wal_file: std::sync::Mutex::new(Some(wal_file)),
         })
     }
 
     /// Checks if an entity has been cryptographically shredded.
     pub fn is_shredded(&self, entity_id: &str) -> bool {
         self.shredded_entities.read().unwrap().contains(entity_id)
+    }
+
+    /// Returns the optional path to the backing write-ahead log.
+    pub fn wal_path(&self) -> Option<&Path> {
+        self.wal_path.as_deref()
     }
 
     /// Computes a collision-resistant 96-bit nonce derived from topic, partition_id, and offset.
@@ -109,25 +123,46 @@ impl EntityKeyRegistry {
     /// Cryptographically shreds an entity (GDPR Right-to-be-Forgotten).
     /// Permanently wipes its DEK, appends to the WAL if configured, and marks as shredded.
     pub fn shred_entity(&self, entity_id: &str) -> bool {
+        self.shred_entities_batch(&[entity_id]) > 0
+    }
+
+    /// Cryptographically shreds a batch of entities in a single atomic operation.
+    /// Wipes their DEKs from memory and performs a single group-committed WAL sync,
+    /// avoiding per-entity physical sync overhead.
+    pub fn shred_entities_batch(&self, entity_ids: &[&str]) -> usize {
         let mut shredded = self.shredded_entities.write().unwrap();
-        let was_new = shredded.insert(entity_id.to_string());
+        let mut newly_shredded = Vec::with_capacity(entity_ids.len());
 
-        let mut keys = self.active_keys.write().unwrap();
-        if let Some(mut key) = keys.remove(entity_id) {
-            // Overwrite memory before drop
-            key.fill(0);
-        }
-
-        if was_new {
-            if let Some(ref wal) = self.wal_path {
-                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(wal) {
-                    let _ = writeln!(file, "{}", entity_id);
-                    let _ = file.sync_data();
-                }
+        for &id in entity_ids {
+            if shredded.insert(id.to_string()) {
+                newly_shredded.push(id);
             }
         }
 
-        was_new
+        if newly_shredded.is_empty() {
+            return 0;
+        }
+
+        let mut keys = self.active_keys.write().unwrap();
+        for &id in &newly_shredded {
+            if let Some(mut key) = keys.remove(id) {
+                // Overwrite memory before drop
+                key.fill(0);
+            }
+        }
+        drop(keys);
+        drop(shredded);
+
+        // Group-commit all newly shredded entities to the persistent WAL
+        let mut file_guard = self.wal_file.lock().unwrap();
+        if let Some(ref mut file) = *file_guard {
+            for &id in &newly_shredded {
+                let _ = writeln!(file, "{}", id);
+            }
+            let _ = file.sync_data();
+        }
+
+        newly_shredded.len()
     }
 
     /// Encrypts plaintext payload with the entity's 256-bit DEK using ChaCha20-Poly1305 AEAD.
