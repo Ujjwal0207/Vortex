@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use vortex_core::error::Result;
-use vortex_guard::{IngressValidator, QuarantinedEvent, ValidationConfig};
+use vortex_guard::{IngressValidator, QuarantinedEvent, ValidationConfig, ValidationOutcome};
 use vortex_protocol::{
     CreateTopicRequest, CreateTopicResponse, ErrorResponse, FetchRequest, FetchResponse, Frame,
     ProduceRequest, ProduceResponse,
@@ -94,25 +94,29 @@ impl Engine {
         check_ingress_watermark(&self.data_dir)?;
 
         // 1. Ingress validation & Poison-Pill Quarantine check
-        if let Err(e) = self.validator.validate(&req.topic, req.key.as_ref(), &req.value) {
-            warn!("Poison pill rejected on topic '{}': {}", req.topic, e);
-            // Route to quarantine
-            let quarantined = QuarantinedEvent::new(
-                &req.topic,
-                &e.to_string(),
-                req.key.as_ref(),
-                &req.value,
-            );
-            self.route_to_quarantine(quarantined).await?;
-            return Err(e);
-        }
+        let final_value = match self.validator.validate_outcome(&req.topic, req.key.as_ref(), &req.value) {
+            Ok(ValidationOutcome::Allowed) => req.value,
+            Ok(ValidationOutcome::Sanitized(clean)) => clean,
+            Err(e) => {
+                warn!("Poison pill rejected on topic '{}': {}", req.topic, e);
+                // Route to quarantine
+                let quarantined = QuarantinedEvent::new(
+                    &req.topic,
+                    &e.to_string(),
+                    req.key.as_ref(),
+                    &req.value,
+                );
+                self.route_to_quarantine(quarantined).await?;
+                return Err(e);
+            }
+        };
 
         // 2. Fetch or create partition log
         let partition = self.get_or_create_partition(&req.topic, req.partition).await?;
         let mut log = partition.write().await;
 
         // 3. Append to partition
-        let record = log.append(req.key, req.value)?;
+        let record = log.append(req.key, final_value)?;
 
         Ok(ProduceResponse {
             offset: record.offset,
@@ -132,18 +136,27 @@ impl Engine {
     ) -> Result<Vec<ProduceResponse>> {
         check_ingress_watermark(&self.data_dir)?;
 
-        for (key, value, _) in &records {
-            if let Err(error) = self.validator.validate(topic, key.as_ref(), value) {
-                warn!("Poison pill rejected on topic '{}': {}", topic, error);
-                let quarantined = QuarantinedEvent::new(topic, &error.to_string(), key.as_ref(), value);
-                self.route_to_quarantine(quarantined).await?;
-                return Err(error);
+        let mut validated_records = Vec::with_capacity(records.len());
+        for (key, value, ts) in records {
+            match self.validator.validate_outcome(topic, key.as_ref(), &value) {
+                Ok(ValidationOutcome::Allowed) => {
+                    validated_records.push((key, value, ts));
+                }
+                Ok(ValidationOutcome::Sanitized(clean)) => {
+                    validated_records.push((key, clean, ts));
+                }
+                Err(error) => {
+                    warn!("Poison pill rejected on topic '{}': {}", topic, error);
+                    let quarantined = QuarantinedEvent::new(topic, &error.to_string(), key.as_ref(), &value);
+                    self.route_to_quarantine(quarantined).await?;
+                    return Err(error);
+                }
             }
         }
 
         let partition = self.get_or_create_partition(topic, partition_id).await?;
         let mut log = partition.write().await;
-        let records = log.append_batch(records)?;
+        let records = log.append_batch(validated_records)?;
         let responses = records
             .into_iter()
             .map(|record| ProduceResponse {
