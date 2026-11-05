@@ -74,8 +74,8 @@ impl TieredArchiveManager {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileExt;
-                seg.file
-                    .read_exact_at(&mut seg_bytes, 0)
+                let file = seg.get_file()?;
+                file.read_exact_at(&mut seg_bytes, 0)
                     .map_err(|e| VortexError::Io(e.to_string()))?;
             }
 
