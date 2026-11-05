@@ -105,7 +105,7 @@ impl MmrInclusionProof {
             return false;
         }
 
-        if self.peak_index >= self.peaks.len() {
+        if self.peak_index >= self.peaks.len() || self.sibling_hashes.len() > 64 {
             return false;
         }
 
