@@ -6,7 +6,6 @@ use vortex_core::{
     error::Result,
     hash::{compute_record_hash, HashDigest},
     record::RECORD_HEADER_SIZE,
-    VortexError,
 };
 
 use crate::partition::PartitionLog;
@@ -43,9 +42,7 @@ impl Scrubber {
         };
 
         let file_len = segment
-            .file
-            .metadata()
-            .map_err(|e| VortexError::Io(e.to_string()))?
+            .metadata()?
             .len();
 
         if file_len <= HEADER_INDEX_REGION_SIZE {
@@ -53,6 +50,7 @@ impl Scrubber {
             return Ok(report);
         }
 
+        let file = segment.get_file()?;
         let mut curr_pos = HEADER_INDEX_REGION_SIZE;
         let mut expected_prev_hash: HashDigest = segment.genesis_hash;
         let mut body_buf = Vec::new();
@@ -60,7 +58,7 @@ impl Scrubber {
         while curr_pos < file_len {
             // Read 4-byte total_len via positional read
             let mut len_buf = [0u8; 4];
-            if let Err(e) = segment.file.read_exact_at(&mut len_buf, curr_pos) {
+            if let Err(e) = file.read_exact_at(&mut len_buf, curr_pos) {
                 report.details.push(format!("Truncated record at pos {}: {}", curr_pos, e));
                 report.healthy = false;
                 break;
@@ -86,7 +84,7 @@ impl Scrubber {
                 break;
             };
             body_buf.resize(body_len, 0);
-            if let Err(e) = segment.file.read_exact_at(&mut body_buf, curr_pos + 4) {
+            if let Err(e) = file.read_exact_at(&mut body_buf, curr_pos + 4) {
                 report.details.push(format!("Read error at pos {}: {}", curr_pos, e));
                 report.healthy = false;
                 break;
@@ -262,8 +260,11 @@ mod tests {
 
         // 2. Inject intentional bit-rot (tamper with a byte in record 2)
         #[cfg(unix)]
-        seg.file.write_all_at(&[0xFF], HEADER_INDEX_REGION_SIZE + 15).unwrap();
-        let _ = seg.file.sync_data();
+        {
+            let file = seg.get_file().unwrap();
+            file.write_all_at(&[0xFF], HEADER_INDEX_REGION_SIZE + 15).unwrap();
+            let _ = file.sync_data();
+        }
 
         // 3. Scrub corrupted segment: must flag corruption
         let corrupt_report = Scrubber::scrub_segment(&seg).unwrap();
