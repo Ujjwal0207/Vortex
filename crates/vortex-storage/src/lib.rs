@@ -17,7 +17,7 @@ pub use compaction::{
     compute_state_merkle_root, deduplicate_records, ChangelogCompactor, CompactionAnchor,
 };
 pub use fd_pool::FdPool;
-pub use gateway::{ActionGateway, PolicyEngine, SimplePolicyEngine};
+pub use gateway::{ActionGateway, AgentBudgetConfig, AgentBudgetGovernor, PolicyEngine, SimplePolicyEngine};
 pub use keyring::TwoSlotKeyring;
 pub use linger::AdaptiveLingerQueue;
 pub use partition::{AppendResult, PartitionLog, PartitionVerifyReport, DEFAULT_MAX_SEGMENT_BYTES};
