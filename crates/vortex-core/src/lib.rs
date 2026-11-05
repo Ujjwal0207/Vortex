@@ -7,6 +7,7 @@ pub mod ore;
 pub mod ratchet;
 pub mod record;
 pub mod shred;
+pub mod spsc;
 pub mod tx;
 
 pub use blind_index::BlindIndexer;
@@ -22,5 +23,6 @@ pub use ore::{OreRangeQuery, OreTag, OrderRevealingIndexer};
 pub use ratchet::{constant_time_eq_32, ForwardSecureRatchet, KeyringSlot, KEYRING_SLOT_SIZE};
 pub use record::{Record, RECORD_HEADER_SIZE};
 pub use shred::EntityKeyRegistry;
+pub use spsc::SpscRingBuffer;
 pub use tx::{IsolationLevel, TransactionCoordinator, CONTROL_TXN_ABORT, CONTROL_TXN_COMMIT};
 
