@@ -357,6 +357,66 @@ impl PartitionLog {
         Ok(records)
     }
 
+    /// Reads raw record byte buffers starting from `start_offset` across segments up to `max_bytes`
+    /// without full record deserialization. Takes `&self` to allow concurrent readers.
+    pub fn read_raw_record_bytes(&self, start_offset: u64, max_bytes: usize) -> Result<Vec<(u64, Bytes)>> {
+        if self.segments.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let first_offset = self.segments[0].base_offset;
+        let next_offset = self.next_offset();
+
+        if start_offset < first_offset || start_offset > next_offset {
+            return Err(VortexError::OffsetOutOfRange {
+                requested: start_offset,
+                earliest: first_offset,
+                latest: next_offset,
+            });
+        }
+
+        if start_offset == next_offset {
+            return Ok(Vec::new());
+        }
+
+        let seg_idx = match self
+            .segments
+            .binary_search_by_key(&start_offset, |s| s.base_offset)
+        {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+
+        let mut results = Vec::new();
+        let mut curr_offset = start_offset;
+        let mut bytes_accumulated = 0;
+        let total_segs = self.segments.len();
+
+        for (i, seg) in self.segments[seg_idx..].iter().enumerate() {
+            if bytes_accumulated >= max_bytes {
+                break;
+            }
+
+            let is_active = (seg_idx + i) == (total_segs.saturating_sub(1));
+            let raw_batch = if is_active {
+                seg.read_raw_record_bytes(curr_offset, max_bytes - bytes_accumulated)?
+            } else {
+                seg.read_raw_record_bytes_with_policy(curr_offset, max_bytes - bytes_accumulated, crate::segment::CachePolicy::ColdDropCache)?
+            };
+
+            for (off, bytes) in raw_batch {
+                bytes_accumulated += bytes.len();
+                curr_offset = off + 1;
+                results.push((off, bytes));
+                if bytes_accumulated >= max_bytes {
+                    break;
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Generates an O(log N) cryptographic MMR inclusion proof for the record at `offset`.
     pub fn generate_inclusion_proof(&self, offset: u64) -> Option<MmrInclusionProof> {
         for seg in &self.segments {
@@ -365,6 +425,50 @@ impl PartitionLog {
             }
         }
         None
+    }
+
+    /// Returns the exact MMR root of the segment containing `offset`.
+    /// Crucial for verifying inclusion proofs of historical records across rolled segments.
+    pub fn segment_mmr_root_for_offset(&self, offset: u64) -> Option<HashDigest> {
+        for seg in &self.segments {
+            if offset >= seg.base_offset && offset < seg.next_offset {
+                return Some(seg.mmr_root());
+            }
+        }
+        None
+    }
+
+    /// Returns the segment boundaries `(base_offset, next_offset)` for the segment containing `offset`.
+    pub fn segment_bounds_for_offset(&self, offset: u64) -> Option<(u64, u64)> {
+        for seg in &self.segments {
+            if offset >= seg.base_offset && offset < seg.next_offset {
+                return Some((seg.base_offset, seg.next_offset));
+            }
+        }
+        None
+    }
+
+    /// Returns the list of `(base_offset, next_offset, mmr_root)` for all segments in this partition.
+    pub fn all_segment_mmr_roots(&self) -> Vec<(u64, u64, HashDigest)> {
+        self.segments
+            .iter()
+            .map(|s| (s.base_offset, s.next_offset, s.mmr_root()))
+            .collect()
+    }
+
+    /// Verifies that an inclusion proof for `offset` correctly demonstrates inclusion
+    /// of `expected_leaf_hash` in this partition's history.
+    pub fn verify_inclusion_proof_for_offset(
+        &self,
+        offset: u64,
+        proof: &MmrInclusionProof,
+        expected_leaf_hash: &HashDigest,
+    ) -> bool {
+        if let Some(expected_root) = self.segment_mmr_root_for_offset(offset) {
+            proof.verify(&expected_root, expected_leaf_hash)
+        } else {
+            false
+        }
     }
 
     /// Returns the active segment's current MMR root.
@@ -1015,6 +1119,66 @@ mod tests {
         let err_tampered_mac =
             PartitionLog::verify_offline_with_seed(&partition_dir, topic, partition_id, Some(&genesis_seed));
         assert!(err_tampered_mac.is_err(), "must fail verification when MAC file is tampered");
+    }
+
+    #[test]
+    fn test_partition_cross_segment_mmr_proof_verification_and_raw_bytes() {
+        let dir = tempdir().unwrap();
+        let topic = "cross-mmr-topic";
+        let mut log = PartitionLog::open_or_create(dir.path(), topic, 0, 1024 * 1024).unwrap();
+
+        // Write 5 records to segment 0
+        for i in 0..5 {
+            log.append(None, Bytes::from(format!("val-{}", i))).unwrap();
+        }
+        log.roll_segment().unwrap();
+
+        // Write 5 records to segment 1
+        for i in 5..10 {
+            log.append(None, Bytes::from(format!("val-{}", i))).unwrap();
+        }
+
+        // Test all_segment_mmr_roots
+        let roots = log.all_segment_mmr_roots();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].0, 0); // base offset
+        assert_eq!(roots[0].1, 5); // next offset
+        assert_eq!(roots[1].0, 5);
+        assert_eq!(roots[1].1, 10);
+
+        // Test segment_mmr_root_for_offset
+        let seg0_root = log.segment_mmr_root_for_offset(2).expect("must find root for offset 2");
+        assert_eq!(seg0_root, roots[0].2);
+
+        let seg1_root = log.segment_mmr_root_for_offset(8).expect("must find root for offset 8");
+        assert_eq!(seg1_root, roots[1].2);
+
+        assert!(log.segment_mmr_root_for_offset(99).is_none());
+
+        // Test segment_bounds_for_offset
+        assert_eq!(log.segment_bounds_for_offset(3), Some((0, 5)));
+        assert_eq!(log.segment_bounds_for_offset(7), Some((5, 10)));
+        assert_eq!(log.segment_bounds_for_offset(100), None);
+
+        // Test cross-segment proof verification via verify_inclusion_proof_for_offset
+        let proof_seg0 = log.generate_inclusion_proof(2).unwrap();
+        assert!(log.verify_inclusion_proof_for_offset(2, &proof_seg0, &proof_seg0.leaf_hash));
+
+        let proof_seg1 = log.generate_inclusion_proof(8).unwrap();
+        assert!(log.verify_inclusion_proof_for_offset(8, &proof_seg1, &proof_seg1.leaf_hash));
+
+        // Negative test: mismatched leaf fails
+        let mut bad_leaf = proof_seg0.leaf_hash;
+        bad_leaf[0] ^= 0xEE;
+        assert!(!log.verify_inclusion_proof_for_offset(2, &proof_seg0, &bad_leaf));
+
+        // Test read_raw_record_bytes
+        let raw_bytes = log.read_raw_record_bytes(0, 1024 * 1024).unwrap();
+        assert_eq!(raw_bytes.len(), 10);
+        for (idx, (off, bytes)) in raw_bytes.into_iter().enumerate() {
+            assert_eq!(off, idx as u64);
+            assert!(!bytes.is_empty());
+        }
     }
 }
 
