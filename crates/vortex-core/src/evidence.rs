@@ -131,6 +131,73 @@ impl ActionRequest {
     }
 }
 
+/// Stage 1B: Causal Multi-Parent DAG Action Request
+/// Enables autonomous AI multi-agent workflows to record directed acyclic graph dependencies,
+/// proving which parent actions and subagent outputs produced this downstream tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CausalActionRequest {
+    pub action_id: String,
+    pub agent_id: String,
+    pub tool_name: String,
+    pub parent_action_hashes: Vec<HashDigest>,
+    pub args_commitment: HashDigest,
+    pub timestamp_ns: u64,
+}
+
+impl CausalActionRequest {
+    pub fn new(
+        agent_id: String,
+        tool_name: String,
+        action_id: String,
+        parent_action_hashes: Vec<HashDigest>,
+        args: &[u8],
+    ) -> Self {
+        let args_commitment = compute_commitment(args);
+        let timestamp_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        Self {
+            action_id,
+            agent_id,
+            tool_name,
+            parent_action_hashes,
+            args_commitment,
+            timestamp_ns,
+        }
+    }
+
+    /// Computes the cryptographic node hash combining all parent causal hashes:
+    /// Blake3("vortex-causal-node-v1:" || XOR(parents) || action_id || agent_id || tool_name || args_commitment || timestamp)
+    pub fn compute_causal_node_hash(&self) -> HashDigest {
+        let mut combined_parent = [0u8; 32];
+        for parent in &self.parent_action_hashes {
+            for (c, p) in combined_parent.iter_mut().zip(parent.iter()) {
+                *c ^= *p;
+            }
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"vortex-causal-node-v1:");
+        hasher.update(&combined_parent);
+        hasher.update(self.action_id.as_bytes());
+        hasher.update(self.agent_id.as_bytes());
+        hasher.update(self.tool_name.as_bytes());
+        hasher.update(&self.args_commitment);
+        hasher.update(&self.timestamp_ns.to_be_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let node_hash = self.compute_causal_node_hash();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"vortex-stage1b-causal-request-v1");
+        hasher.update(&node_hash);
+        hasher.finalize().as_bytes().to_vec()
+    }
+}
+
 /// Stage 2: Policy Decision
 /// Evaluated and committed by the gateway before action execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -442,6 +509,7 @@ impl WitnessCountersignature {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ActionEvidenceRecord {
     Request(ActionRequest),
+    CausalRequest(CausalActionRequest),
     Policy(PolicyDecision),
     Executor(ExecutorReceipt),
     Checkpoint(SignedCheckpoint),
