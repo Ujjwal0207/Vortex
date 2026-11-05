@@ -26,6 +26,12 @@ impl Default for ValidationConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationOutcome {
+    Allowed,
+    Sanitized(Bytes),
+}
+
 pub struct IngressValidator {
     config: ValidationConfig,
     pii_scanner: PiiScanner,
@@ -42,7 +48,7 @@ impl IngressValidator {
     /// Validates an incoming message at the wire boundary before it touches storage.
     /// Fast-path rejection for oversized messages, empty payloads,
     /// structural corruption (poison pills), or security violations (leaked credentials/PII).
-    pub fn validate(&self, topic: &str, key: Option<&Bytes>, value: &Bytes) -> Result<()> {
+    pub fn validate_outcome(&self, topic: &str, key: Option<&Bytes>, value: &Bytes) -> Result<ValidationOutcome> {
         let total_size = key.map(|k| k.len()).unwrap_or(0) + value.len();
 
         // 1. Oversize check (prevents OOM memory exhaustion attacks)
@@ -55,13 +61,18 @@ impl IngressValidator {
             });
         }
 
+        let mut sanitized_payload = None;
+
         // 2. Security & PII Leak Scanner
         if self.config.scan_pii {
             match self.pii_scanner.scan(value, self.config.pii_quarantine) {
                 PiiAction::Quarantine(reason) => {
                     return Err(VortexError::SecurityViolation { reason });
                 }
-                PiiAction::Mask(_) | PiiAction::Allow => {}
+                PiiAction::Mask(clean) => {
+                    sanitized_payload = Some(clean);
+                }
+                PiiAction::Allow => {}
             }
         }
 
@@ -100,6 +111,16 @@ impl IngressValidator {
             }
         }
 
+        if let Some(clean) = sanitized_payload {
+            Ok(ValidationOutcome::Sanitized(clean))
+        } else {
+            Ok(ValidationOutcome::Allowed)
+        }
+    }
+
+    /// Validates an incoming message at the wire boundary before it touches storage.
+    pub fn validate(&self, topic: &str, key: Option<&Bytes>, value: &Bytes) -> Result<()> {
+        let _ = self.validate_outcome(topic, key, value)?;
         Ok(())
     }
 }
