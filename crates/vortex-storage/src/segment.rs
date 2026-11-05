@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use vortex_core::{
     error::Result,
@@ -74,8 +75,10 @@ pub struct Segment {
     pub next_offset: u64,
     pub genesis_hash: HashDigest,
     pub last_record_hash: HashDigest,
+    pub leader_epoch: u32,
     pub path: PathBuf,
-    pub file: File,
+    active_file: Option<Arc<File>>,
+    pub fd_pool: Option<Arc<crate::fd_pool::FdPool>>,
     pub mmap: Option<Mmap>,
     pub index_entries: Vec<IndexEntry>,
     pub current_data_position: u64,
@@ -86,8 +89,98 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// Opens an existing segment or creates a new `.vtx` segment.
+    /// Returns an `Arc<File>` handle for read or write operations.
+    /// If this segment is active, uses its dedicated descriptor.
+    /// If this segment is sealed, acquires a pooled descriptor from the shared `FdPool`.
+    pub fn get_file(&self) -> Result<Arc<File>> {
+        if let Some(ref file) = self.active_file {
+            Ok(file.clone())
+        } else if let Some(ref pool) = self.fd_pool {
+            pool.acquire(&self.path)
+        } else {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .or_else(|_| OpenOptions::new().read(true).open(&self.path))
+                .map_err(|e| VortexError::Io(e.to_string()))?;
+            Ok(Arc::new(file))
+        }
+    }
+
+    /// Convenience accessor for obtaining a file handle.
+    pub fn file(&self) -> Result<Arc<File>> {
+        self.get_file()
+    }
+
+    /// Returns filesystem metadata without permanently pinning an open descriptor.
+    pub fn metadata(&self) -> Result<std::fs::Metadata> {
+        if let Some(ref file) = self.active_file {
+            file.metadata().map_err(|e| VortexError::Io(e.to_string()))
+        } else {
+            std::fs::metadata(&self.path).map_err(|e| VortexError::Io(e.to_string()))
+        }
+    }
+
+    /// Explicitly seals this segment, dropping its dedicated OS file descriptor and mmap.
+    /// Future operations transparently lease descriptors from `fd_pool`.
+    pub fn seal(&mut self) {
+        self.active_file = None;
+        self.mmap = None;
+    }
+
+    /// Returns true if this segment is sealed and leases descriptors on-demand.
+    pub fn is_sealed(&self) -> bool {
+        self.active_file.is_none()
+    }
+
+    /// Associates this segment with a shared `FdPool` for on-demand file descriptor leasing.
+    pub fn set_fd_pool(&mut self, pool: Arc<crate::fd_pool::FdPool>) {
+        self.fd_pool = Some(pool);
+    }
+
+    /// Dynamically updates the leader epoch on this segment, persisting it to both
+    /// the on-disk header metadata block and the commit marker sidecar.
+    pub fn set_leader_epoch(&mut self, epoch: u32) -> Result<()> {
+        if epoch < self.leader_epoch {
+            return Err(VortexError::FencedLeaderEpoch {
+                current: self.leader_epoch,
+                attempted: epoch,
+            });
+        }
+        self.leader_epoch = epoch;
+        let file = self.get_file()?;
+        file.write_all_at(&epoch.to_be_bytes(), 55)
+            .map_err(|e| VortexError::Io(e.to_string()))?;
+        file.sync_data()
+            .map_err(|e| VortexError::Io(e.to_string()))?;
+
+        let mmr_guard = self.mmr.read().unwrap();
+        publish_commit_state(
+            &self.path,
+            &self.commit_path,
+            self.current_data_position,
+            self.next_offset,
+            self.last_record_hash,
+            self.leader_epoch,
+            mmr_guard.count(),
+            &mmr_guard.peaks(),
+        )?;
+        Ok(())
+    }
+
+    /// Opens an existing segment or creates a new `.vtx` segment at default epoch 0.
     pub fn open_or_create(dir: &Path, base_offset: u64, genesis_hash: HashDigest) -> Result<Self> {
+        Self::open_or_create_with_epoch(dir, base_offset, genesis_hash, 0)
+    }
+
+    /// Opens an existing segment or creates a new `.vtx` segment with an explicit leader epoch.
+    pub fn open_or_create_with_epoch(
+        dir: &Path,
+        base_offset: u64,
+        genesis_hash: HashDigest,
+        leader_epoch: u32,
+    ) -> Result<Self> {
         let filename = format!("{:020}.vtx", base_offset);
         let path = dir.join(filename);
         let file_exists = path.exists();
@@ -111,6 +204,7 @@ impl Segment {
             header.put_u64(base_offset);
             header.put_slice(&genesis_hash);
             header.put_u64(0); // created_at placeholder
+            header.put_u32(leader_epoch); // leader_epoch at offset 55
 
             // Pad the header to the fixed 256-byte metadata block. The on-disk
             // index count lives in its final four bytes (offset 252).
@@ -130,6 +224,7 @@ impl Segment {
                 HEADER_INDEX_REGION_SIZE,
                 base_offset,
                 genesis_hash,
+                leader_epoch,
                 0,
                 &[],
             )?;
@@ -139,8 +234,10 @@ impl Segment {
                 next_offset: base_offset,
                 genesis_hash,
                 last_record_hash: genesis_hash,
+                leader_epoch,
                 path,
-                file,
+                active_file: Some(Arc::new(file)),
+                fd_pool: None,
                 mmap: None,
                 index_entries: Vec::new(),
                 current_data_position: HEADER_INDEX_REGION_SIZE,
@@ -177,7 +274,7 @@ impl Segment {
         reader.copy_to_slice(&mut genesis_hash);
 
         let _created_at = reader.get_u64();
-        let _reserved = reader.get_u32();
+        let header_epoch = reader.get_u32();
         // The fixed header index is intentionally treated as a cache. Rebuild it
         // from validated records so checkpoints beyond its 4,080-entry capacity
         // survive restart, and so a torn or stale index cannot direct reads wrongly.
@@ -276,14 +373,17 @@ impl Segment {
 
                 let mmap = unsafe { MmapOptions::new().map(&file).ok() };
 
+                let leader_epoch = state.leader_epoch;
                 return Ok(Self {
                     base_offset,
                     next_offset: state.next_offset,
                     genesis_hash,
                     last_record_hash: state.last_record_hash,
+                    leader_epoch,
                     path,
                     commit_path,
-                    file,
+                    active_file: Some(Arc::new(file)),
+                    fd_pool: None,
                     index_entries: fast_index_entries,
                     current_data_position: state.end_position,
                     bytes_since_last_index: 0,
@@ -382,15 +482,9 @@ impl Segment {
             curr_pos = record_end;
         }
 
-        if let Some(state) = commit_state {
-            if state.next_offset != next_offset || state.last_record_hash != last_hash {
-                return Err(VortexError::Io(format!(
-                    "segment commit marker disagrees with validated records in {}",
-                    path.display()
-                )));
-            }
-        } else {
-            publish_commit_state(&path, &commit_path, curr_pos, next_offset, last_hash, mmr.count(), &mmr.peaks())?;
+        let leader_epoch = commit_state.as_ref().map_or(header_epoch, |s| s.leader_epoch);
+        if commit_state.is_none() {
+            publish_commit_state(&path, &commit_path, curr_pos, next_offset, last_hash, leader_epoch, mmr.count(), &mmr.peaks())?;
         }
 
         let bytes_since_last_index = curr_pos.saturating_sub(last_indexed_pos);
@@ -402,8 +496,10 @@ impl Segment {
             next_offset,
             genesis_hash,
             last_record_hash: last_hash,
+            leader_epoch,
             path,
-            file,
+            active_file: Some(Arc::new(file)),
+            fd_pool: None,
             mmap,
             index_entries,
             current_data_position: curr_pos,
@@ -515,10 +611,11 @@ impl Segment {
             data: buffer.freeze(),
         }];
 
-        if let Err(error) = BatchedPositionalIo::write_batch(&self.file, &batch_req)
-            .and_then(|_| self.file.sync_data().map_err(|e| VortexError::Io(e.to_string())))
+        let file = self.get_file()?;
+        if let Err(error) = BatchedPositionalIo::write_batch(&file, &batch_req)
+            .and_then(|_| file.sync_data().map_err(|e| VortexError::Io(e.to_string())))
         {
-            if let Err(rollback) = self.file.set_len(old_position).and_then(|_| self.file.sync_data()) {
+            if let Err(rollback) = file.set_len(old_position).and_then(|_| file.sync_data()) {
                 self.poisoned = true;
                 return Err(VortexError::Io(format!(
                     "segment batch write failed ({error}); rollback failed ({rollback}); restart required"
@@ -540,6 +637,7 @@ impl Segment {
             curr_pos,
             curr_offset,
             curr_hash,
+            self.leader_epoch,
             new_leaf_count,
             &new_peaks,
         ) {
@@ -581,13 +679,12 @@ impl Segment {
         writer.put_u64(entry.physical_position);
         writer.put_u32(entry.timestamp_delta);
 
-        self.file
-            .write_all_at(&buf, entry_pos)
+        let file = self.get_file()?;
+        file.write_all_at(&buf, entry_pos)
             .map_err(|e| VortexError::Io(e.to_string()))?;
 
         // Update index count in header at offset 252
-        self.file
-            .write_all_at(&(entry_idx as u32 + 1).to_be_bytes(), 252)
+        file.write_all_at(&(entry_idx as u32 + 1).to_be_bytes(), 252)
             .map_err(|e| VortexError::Io(e.to_string()))?;
 
         Ok(())
@@ -595,8 +692,8 @@ impl Segment {
 
     /// Flushes uncommitted file buffers to disk (`fdatasync`).
     pub fn flush(&mut self) -> Result<()> {
-        self.file
-            .sync_data()
+        let file = self.get_file()?;
+        file.sync_data()
             .map_err(|e| VortexError::Io(e.to_string()))
     }
 
@@ -625,21 +722,21 @@ impl Segment {
         // Find nearest starting file position via binary search in sparse index
         let start_pos = self.find_file_position(start_offset);
 
+        let file = self.get_file()?;
         let mut records = Vec::new();
         let mut bytes_read = 0;
         let mut curr_pos = start_pos;
 
         while curr_pos < self.current_data_position && bytes_read < max_bytes {
             let mut len_buf = [0u8; 4];
-            if self.file.read_exact_at(&mut len_buf, curr_pos).is_err() {
+            if file.read_exact_at(&mut len_buf, curr_pos).is_err() {
                 break;
             }
             let total_len = u32::from_be_bytes(len_buf) as usize;
             let full_record_len = 4 + total_len;
 
             let mut raw_record = vec![0u8; full_record_len];
-            self.file
-                .read_exact_at(&mut raw_record, curr_pos)
+            file.read_exact_at(&mut raw_record, curr_pos)
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
             let mut slice = &raw_record[..];
@@ -653,7 +750,7 @@ impl Segment {
             curr_pos += full_record_len as u64;
         }
 
-        advise_cache_policy(&self.file, start_pos, curr_pos.saturating_sub(start_pos), policy);
+        advise_cache_policy(&file, start_pos, curr_pos.saturating_sub(start_pos), policy);
 
         Ok(records)
     }
@@ -690,11 +787,12 @@ impl Segment {
     }
 
     fn rebuild_mmr_tree(&self) {
+        let Ok(file) = self.get_file() else { return; };
         let mut new_mmr = MerkleMountainRange::new();
         let mut curr_pos = HEADER_INDEX_REGION_SIZE;
         while curr_pos < self.current_data_position {
             let mut len_buf = [0u8; 4];
-            if self.file.read_exact_at(&mut len_buf, curr_pos).is_err() {
+            if file.read_exact_at(&mut len_buf, curr_pos).is_err() {
                 break;
             }
             let total_len = u32::from_be_bytes(len_buf) as u64;
@@ -702,7 +800,7 @@ impl Segment {
                 break;
             }
             let mut hash_buf = [0u8; 32];
-            if self.file.read_exact_at(&mut hash_buf, curr_pos + 56).is_ok() {
+            if file.read_exact_at(&mut hash_buf, curr_pos + 56).is_ok() {
                 new_mmr.append(hash_buf);
             }
             curr_pos += 4 + total_len;
@@ -732,21 +830,21 @@ impl Segment {
         }
 
         let start_pos = self.find_file_position(start_offset);
+        let file = self.get_file()?;
         let mut records = Vec::new();
         let mut bytes_read = 0;
         let mut curr_pos = start_pos;
 
         while curr_pos < self.current_data_position && bytes_read < max_bytes {
             let mut len_buf = [0u8; 4];
-            if self.file.read_exact_at(&mut len_buf, curr_pos).is_err() {
+            if file.read_exact_at(&mut len_buf, curr_pos).is_err() {
                 break;
             }
             let total_len = u32::from_be_bytes(len_buf) as usize;
             let full_record_len = 4 + total_len;
 
             let mut raw_record = vec![0u8; full_record_len];
-            self.file
-                .read_exact_at(&mut raw_record, curr_pos)
+            file.read_exact_at(&mut raw_record, curr_pos)
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
             if raw_record.len() >= 16 {
@@ -760,7 +858,7 @@ impl Segment {
             curr_pos += full_record_len as u64;
         }
 
-        advise_cache_policy(&self.file, start_pos, curr_pos.saturating_sub(start_pos), policy);
+        advise_cache_policy(&file, start_pos, curr_pos.saturating_sub(start_pos), policy);
 
         Ok(records)
     }
@@ -797,11 +895,12 @@ impl Segment {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CommitState {
     end_position: u64,
     next_offset: u64,
     last_record_hash: HashDigest,
+    leader_epoch: u32,
     mmr_state: Option<(u64, Vec<HashDigest>)>,
 }
 
@@ -840,16 +939,18 @@ fn read_commit_state(path: &Path) -> Result<Option<CommitState>> {
         let mmr_leaf_count = u64::from_be_bytes(bytes[56..64].try_into().unwrap());
 
         let mut mmr_peaks = Vec::with_capacity(peak_count);
-        for i in 0..peak_count.min(64) {
+        for i in 0..peak_count.min(63) {
             let start = 64 + i * 32;
             let mut peak = [0u8; 32];
             peak.copy_from_slice(&bytes[start..start + 32]);
             mmr_peaks.push(peak);
         }
+        let leader_epoch = u32::from_be_bytes(bytes[2108..2112].try_into().unwrap());
         Ok(Some(CommitState {
             end_position,
             next_offset,
             last_record_hash,
+            leader_epoch,
             mmr_state: Some((mmr_leaf_count, mmr_peaks)),
         }))
     } else if length == COMMIT_STATE_SIZE as u64 {
@@ -873,6 +974,7 @@ fn read_commit_state(path: &Path) -> Result<Option<CommitState>> {
             end_position,
             next_offset,
             last_record_hash,
+            leader_epoch: 0,
             mmr_state: None,
         }))
     } else {
@@ -886,23 +988,25 @@ fn publish_commit_state(
     end_position: u64,
     next_offset: u64,
     last_record_hash: HashDigest,
+    leader_epoch: u32,
     mmr_leaf_count: u64,
     mmr_peaks: &[HashDigest],
 ) -> Result<()> {
     let mut bytes = [0u8; COMMIT_STATE_V2_SIZE];
     bytes[0..4].copy_from_slice(&COMMIT_STATE_MAGIC_V2.to_be_bytes());
     bytes[4] = COMMIT_STATE_VERSION_2;
-    let peak_count = mmr_peaks.len().min(64) as u16;
+    let peak_count = mmr_peaks.len().min(63) as u16;
     bytes[6..8].copy_from_slice(&peak_count.to_be_bytes());
     bytes[8..16].copy_from_slice(&end_position.to_be_bytes());
     bytes[16..24].copy_from_slice(&next_offset.to_be_bytes());
     bytes[24..56].copy_from_slice(&last_record_hash);
     bytes[56..64].copy_from_slice(&mmr_leaf_count.to_be_bytes());
 
-    for (i, peak) in mmr_peaks.iter().take(64).enumerate() {
+    for (i, peak) in mmr_peaks.iter().take(63).enumerate() {
         let start = 64 + i * 32;
         bytes[start..start + 32].copy_from_slice(peak);
     }
+    bytes[2108..2112].copy_from_slice(&leader_epoch.to_be_bytes());
 
     let checksum = crc32fast::hash(&bytes[..2112]);
     bytes[2112..2116].copy_from_slice(&checksum.to_be_bytes());
@@ -969,7 +1073,7 @@ mod tests {
 
         // Treat the on-disk index as a rebuildable cache: even a missing count
         // must be reconstructed from the validated data region on restart.
-        seg.file.write_all_at(&0u32.to_be_bytes(), 252).unwrap();
+        seg.get_file().unwrap().write_all_at(&0u32.to_be_bytes(), 252).unwrap();
 
         // Close and recover existing segment
         drop(seg);
@@ -981,7 +1085,7 @@ mod tests {
         assert_eq!(recovered.index_entries[0].relative_offset, 0);
         assert_eq!(recovered.read(5, 1024 * 1024).unwrap().len(), 5);
         let mut stored_count = [0u8; 4];
-        recovered.file.read_exact_at(&mut stored_count, 252).unwrap();
+        recovered.get_file().unwrap().read_exact_at(&mut stored_count, 252).unwrap();
         assert_eq!(u32::from_be_bytes(stored_count), 1);
     }
 
@@ -1005,7 +1109,7 @@ mod tests {
         torn_data[0..4].copy_from_slice(&116u32.to_be_bytes());
         // Deliberately wrong CRC / corrupted body
         torn_data[4..8].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
-        seg.file.write_all_at(&torn_data, valid_size).unwrap();
+        seg.get_file().unwrap().write_all_at(&torn_data, valid_size).unwrap();
         drop(seg);
 
         // Reopen segment: recovery must detect torn tail write, truncate it to valid_size,
@@ -1031,8 +1135,11 @@ mod tests {
         let second = Record::new(first.record_hash, first.offset + 1, None, Bytes::from_static(b"two"));
         let mut uncommitted = BytesMut::from(first.encode().as_ref());
         uncommitted.extend_from_slice(second.encode().as_ref());
-        seg.file.write_all_at(&uncommitted, committed_end).unwrap();
-        seg.file.sync_data().unwrap();
+        {
+            let file = seg.get_file().unwrap();
+            file.write_all_at(&uncommitted, committed_end).unwrap();
+            file.sync_data().unwrap();
+        }
         drop(seg);
 
         let recovered = Segment::open_or_create(dir.path(), 0, genesis).unwrap();
