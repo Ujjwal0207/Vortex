@@ -42,6 +42,16 @@ impl Engine {
         &self.reactor
     }
 
+    /// Dispatches a partition task with CPU cache affinity via the reactor router (Flaw 6.4).
+    #[allow(dead_code)]
+    pub async fn dispatch_on_partition<F, R>(&self, topic: &str, partition: u32, op: F) -> Result<R>
+    where
+        F: FnOnce() -> Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        self.reactor.dispatch(topic, partition, op).await
+    }
+
     /// Handles a raw client frame and produces an appropriate response frame.
     pub async fn handle_frame(&self, frame: Frame) -> Frame {
         let req_id = frame.req_id;
@@ -211,5 +221,26 @@ impl Engine {
 
     fn error_frame(req_id: u32, code: u16, message: String) -> Frame {
         ErrorResponse { code, message }.encode(req_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_engine_dispatch_on_partition_affinity() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::new(dir.path().to_path_buf());
+
+        let res = engine
+            .dispatch_on_partition("orders", 0, || {
+                Ok(42u64)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(res, 42);
     }
 }
