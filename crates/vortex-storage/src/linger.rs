@@ -18,7 +18,21 @@ pub struct AdaptiveLingerQueue {
 
 impl AdaptiveLingerQueue {
     pub fn new(
-        mut partition: PartitionLog,
+        partition: PartitionLog,
+        linger_duration: Duration,
+        max_batch_records: usize,
+        max_batch_bytes: usize,
+    ) -> Self {
+        Self::from_shared(
+            std::sync::Arc::new(tokio::sync::RwLock::new(partition)),
+            linger_duration,
+            max_batch_records,
+            max_batch_bytes,
+        )
+    }
+
+    pub fn from_shared(
+        partition: std::sync::Arc<tokio::sync::RwLock<PartitionLog>>,
         linger_duration: Duration,
         max_batch_records: usize,
         max_batch_bytes: usize,
@@ -44,19 +58,19 @@ impl AdaptiveLingerQueue {
                                 batch.push(item);
 
                                 if batch.len() >= max_batch_records || accumulated_bytes >= max_batch_bytes {
-                                    flush_batch(&mut partition, &mut batch, &mut accumulated_bytes);
+                                    flush_batch(&partition, &mut batch, &mut accumulated_bytes).await;
                                 }
                             }
                             None => {
                                 if !batch.is_empty() {
-                                    flush_batch(&mut partition, &mut batch, &mut accumulated_bytes);
+                                    flush_batch(&partition, &mut batch, &mut accumulated_bytes).await;
                                 }
                                 break;
                             }
                         }
                     }
                     _ = &mut timeout_fut, if !batch.is_empty() => {
-                        flush_batch(&mut partition, &mut batch, &mut accumulated_bytes);
+                        flush_batch(&partition, &mut batch, &mut accumulated_bytes).await;
                     }
                 }
             }
@@ -94,8 +108,8 @@ impl AdaptiveLingerQueue {
     }
 }
 
-fn flush_batch(
-    partition: &mut PartitionLog,
+async fn flush_batch(
+    partition: &std::sync::Arc<tokio::sync::RwLock<PartitionLog>>,
     batch: &mut Vec<PendingAppend>,
     accumulated_bytes: &mut usize,
 ) {
@@ -114,7 +128,8 @@ fn flush_batch(
         responders.push(item.responder);
     }
 
-    let append_res = partition.append_batch_authenticated(records_to_append);
+    let mut log = partition.write().await;
+    let append_res = log.append_batch_authenticated(records_to_append);
     match append_res {
         Ok(results) => {
             for (responder, result) in responders.into_iter().zip(results) {
