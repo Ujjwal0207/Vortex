@@ -11,6 +11,8 @@ use vortex_core::{
     HashDigest, MerkleMountainRange, MmrInclusionProof, VortexError,
 };
 
+use crate::batch_io::{BatchedPositionalIo, BatchedWriteRequest};
+
 /// 64 KB pre-allocated header and sparse index region.
 pub const HEADER_INDEX_REGION_SIZE: u64 = 65_536;
 pub const SEGMENT_MAGIC: u32 = 0x56545831; // "VTX1"
@@ -426,8 +428,13 @@ impl Segment {
         }
 
         let old_position = self.current_data_position;
-        if let Err(error) = self.file.write_all_at(&buffer, old_position)
-            .and_then(|_| self.file.sync_data())
+        let batch_req = [BatchedWriteRequest {
+            file_position: old_position,
+            data: buffer.freeze(),
+        }];
+
+        if let Err(error) = BatchedPositionalIo::write_batch(&self.file, &batch_req)
+            .and_then(|_| self.file.sync_data().map_err(|e| VortexError::Io(e.to_string())))
         {
             if let Err(rollback) = self.file.set_len(old_position).and_then(|_| self.file.sync_data()) {
                 self.poisoned = true;
@@ -435,7 +442,7 @@ impl Segment {
                     "segment batch write failed ({error}); rollback failed ({rollback}); restart required"
                 )));
             }
-            return Err(VortexError::Io(error.to_string()));
+            return Err(error);
         }
 
         if let Err(error) = publish_commit_state(
@@ -576,13 +583,71 @@ impl Segment {
         self.mmr.generate_proof(leaf_index)
     }
 
+    /// Reads raw record byte buffers starting from `start_offset` up to `max_bytes`
+    /// without full CPU record deserialization (Phase 1 zero-copy wire path).
+    pub fn read_raw_record_bytes(
+        &self,
+        start_offset: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<(u64, Bytes)>> {
+        self.read_raw_record_bytes_with_policy(start_offset, max_bytes, CachePolicy::Hot)
+    }
+
+    /// Reads raw record byte buffers with specified cache policy.
+    pub fn read_raw_record_bytes_with_policy(
+        &self,
+        start_offset: u64,
+        max_bytes: usize,
+        policy: CachePolicy,
+    ) -> Result<Vec<(u64, Bytes)>> {
+        if start_offset < self.base_offset || start_offset >= self.next_offset {
+            return Ok(Vec::new());
+        }
+
+        let start_pos = self.find_file_position(start_offset);
+        let mut records = Vec::new();
+        let mut bytes_read = 0;
+        let mut curr_pos = start_pos;
+
+        while curr_pos < self.current_data_position && bytes_read < max_bytes {
+            let mut len_buf = [0u8; 4];
+            if self.file.read_exact_at(&mut len_buf, curr_pos).is_err() {
+                break;
+            }
+            let total_len = u32::from_be_bytes(len_buf) as usize;
+            let full_record_len = 4 + total_len;
+
+            let mut raw_record = vec![0u8; full_record_len];
+            self.file
+                .read_exact_at(&mut raw_record, curr_pos)
+                .map_err(|e| VortexError::Io(e.to_string()))?;
+
+            if raw_record.len() >= 16 {
+                let rec_offset = u64::from_be_bytes(raw_record[8..16].try_into().unwrap());
+                if rec_offset >= start_offset {
+                    bytes_read += full_record_len;
+                    records.push((rec_offset, Bytes::from(raw_record)));
+                }
+            }
+
+            curr_pos += full_record_len as u64;
+        }
+
+        advise_cache_policy(&self.file, start_pos, curr_pos.saturating_sub(start_pos), policy);
+
+        Ok(records)
+    }
+
     /// Performs binary search over the sparse index to locate the closest physical file offset.
     fn find_file_position(&self, target_offset: u64) -> u64 {
-        if self.index_entries.is_empty() {
+        if self.index_entries.is_empty() || target_offset <= self.base_offset {
             return HEADER_INDEX_REGION_SIZE;
         }
 
-        let rel_target = (target_offset - self.base_offset) as u32;
+        let rel_target = match u32::try_from(target_offset.saturating_sub(self.base_offset)) {
+            Ok(v) => v,
+            Err(_) => u32::MAX,
+        };
 
         match self
             .index_entries
@@ -953,6 +1018,31 @@ mod tests {
         assert_eq!(reopened.mmr_root(), root);
         let proof = reopened.generate_inclusion_proof(105).unwrap();
         assert!(proof.verify(&root, &proof.leaf_hash));
+    }
+
+    #[test]
+    fn test_segment_find_file_position_defensive_bounds_and_underflow() {
+        let dir = tempdir().unwrap();
+        let genesis = compute_genesis_hash("defensive-bounds", 0);
+        let mut seg = Segment::open_or_create(dir.path(), 500, genesis).unwrap();
+
+        for i in 0..10 {
+            seg.append(None, Bytes::from(format!("payload-{}", i))).unwrap();
+        }
+
+        // Test offset strictly less than base_offset (must not underflow or panic)
+        assert_eq!(seg.find_file_position(0), HEADER_INDEX_REGION_SIZE);
+        assert_eq!(seg.find_file_position(499), HEADER_INDEX_REGION_SIZE);
+        assert_eq!(seg.find_file_position(500), HEADER_INDEX_REGION_SIZE);
+
+        // Test huge offset far beyond base_offset + u32::MAX
+        let huge_pos = seg.find_file_position(u64::MAX);
+        assert!(huge_pos >= HEADER_INDEX_REGION_SIZE);
+
+        // Test raw record bytes fast-path
+        let raw_records = seg.read_raw_record_bytes(502, 1024).unwrap();
+        assert!(!raw_records.is_empty());
+        assert_eq!(raw_records[0].0, 502);
     }
 }
 
