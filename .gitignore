@@ -1,7 +1,14 @@
 # Plans & Instructions (as requested)
+JOURNEY*.md
+*JOURNEY*
+*journey*
 PHASES_PLAN.md
 PHASES*.md
 PHASE_*.md
+
+# Internal Benchmark & Stress Test Harnesses
+crates/vortex-ffi/examples/reality_check.rs
+crates/vortex-ffi/examples/enterprise_harsh_check.rs
 PHASE_3.md
 PHASE_4.md
 PHASE_5_MULTI_SERVER.md
