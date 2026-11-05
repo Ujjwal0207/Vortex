@@ -23,6 +23,7 @@ pub struct Engine {
     data_dir: PathBuf,
     validator: IngressValidator,
     partitions: RwLock<HashMap<(String, u32), PartitionHandle>>,
+    pub fd_pool: Arc<vortex_storage::FdPool>,
     #[allow(dead_code)]
     pub reactor: crate::reactor::PartitionAffinityRouter,
 }
@@ -34,10 +35,12 @@ impl Engine {
             .map(|n| n.get())
             .unwrap_or(4);
         let reactor = crate::reactor::PartitionAffinityRouter::new(num_workers, 1024);
+        let fd_pool = Arc::new(vortex_storage::FdPool::new(512));
         Self {
             data_dir,
             validator,
             partitions: RwLock::new(HashMap::new()),
+            fd_pool,
             reactor,
         }
     }
@@ -128,8 +131,18 @@ impl Engine {
         })
     }
 
+    /// Produces a message with strict leader epoch verification to protect against zombie split-brain divergence.
+    pub async fn produce_with_epoch(&self, req: ProduceRequest, leader_epoch: u32) -> Result<ProduceResponse> {
+        let partition = self.get_or_create_partition(&req.topic, req.partition).await?;
+        {
+            let log = partition.log.read().await;
+            log.verify_leader_epoch(leader_epoch)?;
+        }
+        self.produce(req).await
+    }
+
     /// Validates every record before appending any of them. This prevents a
-    /// later policy rejection from leaving the accepted prefix of a Kafka batch
+    /// later policy rejection from leaving the accepted prefix of a batch
     /// in the user partition.
     pub async fn produce_batch(
         &self,
@@ -186,6 +199,20 @@ impl Engine {
         Ok((log.earliest_offset(), log.next_offset()))
     }
 
+    /// Advances the leader epoch for a partition log monotonically.
+    pub async fn advance_leader_epoch(&self, topic: &str, partition_id: u32, new_epoch: u32) -> Result<()> {
+        let part = self.get_or_create_partition(topic, partition_id).await?;
+        let mut log = part.log.write().await;
+        log.advance_leader_epoch(new_epoch)
+    }
+
+    /// Returns the current leader epoch for a partition log.
+    pub async fn leader_epoch(&self, topic: &str, partition_id: u32) -> Result<u32> {
+        let part = self.get_or_create_partition(topic, partition_id).await?;
+        let log = part.log.read().await;
+        Ok(log.leader_epoch())
+    }
+
     pub async fn create_topic(&self, topic: &str, partitions: u32) -> Result<CreateTopicResponse> {
         for p in 0..partitions {
             self.get_or_create_partition(topic, p).await?;
@@ -222,11 +249,12 @@ impl Engine {
             return Ok(part.clone());
         }
 
-        let log = PartitionLog::open_or_create(
+        let log = PartitionLog::open_or_create_with_pool(
             &self.data_dir,
             topic,
             partition_id,
             DEFAULT_MAX_SEGMENT_BYTES,
+            self.fd_pool.clone(),
         )?;
 
         let shared = Arc::new(RwLock::new(log));
