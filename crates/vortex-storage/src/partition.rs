@@ -102,6 +102,7 @@ impl PartitionLog {
             // Load existing segments in sequence
             let mut last_hash: Option<HashDigest> = None;
             let mut expected_base_offset: Option<u64> = None;
+            let mut quarantine_occurred = false;
 
             for file_path in segment_files {
                 let stem = file_path
@@ -116,7 +117,30 @@ impl PartitionLog {
                 })?;
 
                 let genesis = last_hash.unwrap_or_else(|| compute_genesis_hash(topic, partition_id));
-                let seg = Segment::open_or_create(&dir, base_offset, genesis)?;
+                let seg = match Segment::open_or_create(&dir, base_offset, genesis) {
+                    Ok(seg) => seg,
+                    Err(e) => {
+                        let quarantine_dir = dir.join(".quarantine");
+                        let _ = fs::create_dir_all(&quarantine_dir);
+                        let file_name = file_path.file_name().unwrap_or_default();
+                        let target_path = quarantine_dir.join(format!(
+                            "{}.corrupt.{}",
+                            file_name.to_string_lossy(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        ));
+                        let _ = fs::rename(&file_path, &target_path);
+                        let commit_path = file_path.with_file_name(format!("{}.commit", file_name.to_string_lossy()));
+                        if commit_path.exists() {
+                            let _ = fs::rename(&commit_path, quarantine_dir.join(format!("{}.commit.corrupt", file_name.to_string_lossy())));
+                        }
+                        tracing::warn!("Quarantined corrupted segment {:?} to {:?}: {}", file_path, target_path, e);
+                        quarantine_occurred = true;
+                        continue;
+                    }
+                };
 
                 // Retention may remove a prefix of the log, so the first remaining
                 // segment is the trusted chain anchor. Every following segment must
@@ -131,7 +155,7 @@ impl PartitionLog {
                     )));
                 }
                 if let Some(expected) = expected_base_offset {
-                    if seg.base_offset != expected {
+                    if seg.base_offset != expected && !quarantine_occurred {
                         return Err(VortexError::Io(format!(
                             "segment offset gap or overlap: expected base offset {expected}, found {} in {:?}",
                             seg.base_offset, file_path
@@ -139,7 +163,7 @@ impl PartitionLog {
                     }
                 }
                 if let Some(expected_genesis) = last_hash {
-                    if seg.genesis_hash != expected_genesis {
+                    if seg.genesis_hash != expected_genesis && !quarantine_occurred {
                         return Err(VortexError::Io(format!(
                             "segment hash-chain discontinuity at base offset {} in {:?}",
                             seg.base_offset, file_path
@@ -150,6 +174,12 @@ impl PartitionLog {
                 expected_base_offset = Some(seg.next_offset);
                 last_hash = Some(seg.last_record_hash);
                 segments.push(seg);
+            }
+
+            if segments.is_empty() {
+                let genesis = compute_genesis_hash(topic, partition_id);
+                let active = Segment::open_or_create(&dir, 0, genesis)?;
+                segments.push(active);
             }
         }
 
@@ -478,13 +508,13 @@ impl PartitionLog {
 
     /// Returns the active segment's current MMR tree size (leaf count).
     pub fn active_tree_size(&self) -> u64 {
-        self.segments.last().map(|s| s.mmr.count()).unwrap_or(0)
+        self.segments.last().map(|s| s.mmr_count()).unwrap_or(0)
     }
 
     /// Generates an MMR consistency proof proving that the tree at `old_size`
     /// is an exact append-only prefix of the active tree at current size.
     pub fn generate_consistency_proof(&self, old_size: u64) -> Option<vortex_core::MmrConsistencyProof> {
-        self.segments.last().and_then(|s| s.mmr.generate_consistency_proof(old_size))
+        self.segments.last().and_then(|s| s.generate_consistency_proof(old_size))
     }
 
     /// Prunes expired sealed segments based on size (retention_bytes) and time (retention_ms).
