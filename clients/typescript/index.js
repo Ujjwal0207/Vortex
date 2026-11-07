@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const net = require('net');
+const { GenAiEvent } = require('./gen_ai');
 
 const API_KEY_PRODUCE = 0;
 const API_KEY_FETCH = 1;
@@ -189,6 +190,11 @@ class VortexClient {
     });
   }
 
+  async produceAgentEvent(topic, event, key = '', partition = 0) {
+    const value = event.toBytes();
+    return this.produce(topic, value, key, partition);
+  }
+
   async close() {
     if (this.socket) {
       this.socket.end();
@@ -200,6 +206,7 @@ class VortexClient {
 
 module.exports = {
   VortexClient,
+  GenAiEvent,
   computeRecordHash,
   verifyHashChain,
   encodeFrame,
