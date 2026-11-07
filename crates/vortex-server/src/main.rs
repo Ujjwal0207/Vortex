@@ -5,16 +5,19 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use vortex_server::{handle_connection, ConsumerGroupCoordinator, Engine};
+use vortex_server::{handle_connection, ArrowFlightService, ConsumerGroupCoordinator, Engine};
 
 #[derive(Parser, Debug)]
 #[command(name = "vortex-server", version = "0.1.0", about = "Vortex Next-Gen Event Streaming Broker")]
 struct Args {
-    #[arg(short, long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
     #[arg(short, long, default_value_t = 9092)]
     port: u16,
+
+    #[arg(long, default_value_t = 8443)]
+    flight_port: u16,
 
     #[arg(short, long, default_value = "./data/vortex")]
     data_dir: PathBuf,
@@ -41,6 +44,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let engine = Arc::new(Engine::new(args.data_dir.clone()));
     let coordinator = Arc::new(ConsumerGroupCoordinator::new(&args.data_dir, std::time::Duration::from_secs(30))?);
+
+    // Spawn Arrow Flight Columnar IPC Streaming Service
+    let flight_addr = format!("{}:{}", args.host, args.flight_port);
+    let flight_service = Arc::new(ArrowFlightService::new(Arc::clone(&engine), flight_addr));
+    tokio::spawn(async move {
+        if let Err(e) = flight_service.start().await {
+            error!("Arrow Flight service encountered fatal error: {}", e);
+        }
+    });
+
     let listener = TcpListener::bind(&addr).await?;
 
     loop {
@@ -165,6 +178,6 @@ mod tests {
         assert_eq!(r.get_i32(), 777); // Matching correlation ID
         assert_eq!(r.get_i16(), 0);   // ErrorCode: NONE
         let api_count = r.get_i32();
-        assert_eq!(api_count, 12);    // APIs currently advertised by the bridge.
+        assert_eq!(api_count, vortex_server::bridge::KafkaBridge::SUPPORTED_API_VERSIONS.len() as i32); // APIs currently advertised by the bridge.
     }
 }
