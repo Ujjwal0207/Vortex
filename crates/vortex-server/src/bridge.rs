@@ -1500,7 +1500,7 @@ mod tests {
         let _size = r.get_i32();
         assert_eq!(r.get_i32(), 999); // Matching correlation ID
         assert_eq!(r.get_i16(), 0);   // ErrorCode: NONE
-        assert_eq!(r.get_i32(), 12);  // 12 exposed APIs in the matrix.
+        assert_eq!(r.get_i32(), KafkaBridge::SUPPORTED_API_VERSIONS.len() as i32); // Advertised APIs in the matrix.
 
         // 2. Metadata Request v1 (Checks no cluster_id shift corruption)
         let mut meta_req = BytesMut::new();
