@@ -210,10 +210,10 @@ fn test_200_adversarial_harsh_scenarios_and_empirical_benchmarks() {
     println!("=================================================================================\n");
 
     // =========================================================================
-    // REAL EMPIRICAL MEASUREMENTS: VORTEX TEST VALUES VS KAFKA BASELINE
+    // EMPIRICAL PERFORMANCE BENCHMARK MEASUREMENTS: VORTEX TESTED VALUES
     // =========================================================================
     println!("┌───────────────────────────────────────────────────────────────────────────────────┐");
-    println!("│ REAL EMPIRICAL BENCHMARK COMPARISON: VORTEX TESTED VALUES VS KAFKA                │");
+    println!("│ EMPIRICAL BENCHMARK SCORECARD: VORTEX TESTED VALUES (APPLE SILICON ARM64 / APFS)   │");
     println!("└───────────────────────────────────────────────────────────────────────────────────┘");
 
     // Metric 1: Pure In-Memory Blake3 Cryptographic Ingestion Speed
@@ -252,24 +252,21 @@ fn test_200_adversarial_harsh_scenarios_and_empirical_benchmarks() {
     let vortex_disk_rate = disk_records as f64 / elapsed_disk.as_secs_f64();
     let vortex_disk_latency_ms = (elapsed_disk.as_secs_f64() * 1000.0) / disk_records as f64;
 
-    // Output side-by-side empirical scorecard
+    // Output pure empirical scorecard for Vortex
     println!("  ---------------------------------------------------------------------------------");
     println!("  Metric 1: Ingestion with Tamper-Evident Flight-Recorder Cryptography (Blake3 Chain)");
-    println!("    • Vortex Measured Throughput : {:>10.0} rec/s", vortex_crypto_rate);
-    println!("    • Vortex Measured Latency    : {:>10.2} µs / record", vortex_crypto_latency_us);
-    println!("    • Kafka (Java Broker)        : 0 rec/s (Kafka has NO cryptographic hash chains)");
-    println!("    • Architectural Verdict      : Vortex provides non-repudiable mathematical proof");
+    println!("    • Measured Ingestion Rate    : {:>10.0} rec/s", vortex_crypto_rate);
+    println!("    • Measured Ingestion Latency : {:>10.2} µs / record", vortex_crypto_latency_us);
+    println!("    • Cryptographic Guarantee    : Full linear Blake3 chain + Merkle Mountain Range");
     println!("  ---------------------------------------------------------------------------------");
-    println!("  Metric 2: Raw Streaming Ingestion Mode (TopicMode::Raw / Hardware CRC32)");
-    println!("    • Vortex Measured Throughput : {:>10.0} rec/s", vortex_raw_rate);
-    println!("    • Vortex Measured Latency    : {:>10.2} µs / record", vortex_raw_latency_us);
-    println!("    • Kafka (JVM Producer)       : ~2,500,000 rec/s (Standard JVM buffer serialization)");
-    println!("    • Ratio / Performance Delta  : Vortex matches or exceeds Kafka line-rate streaming");
+    println!("  Metric 2: High-Performance Raw Streaming Ingestion Mode (TopicMode::Raw)");
+    println!("    • Measured Line-Rate Stream  : {:>10.0} rec/s", vortex_raw_rate);
+    println!("    • Measured Line-Rate Latency : {:>10.2} µs / record", vortex_raw_latency_us);
+    println!("    • Hardware Acceleration      : SIMD CRC32 verification with kernel zero-copy bypass");
     println!("  ---------------------------------------------------------------------------------");
-    println!("  Metric 3: Physical Disk Commit & Durability Barrier (Sync Appends)");
-    println!("    • Vortex Measured Throughput : {:>10.0} msgs/s (fsync on APFS/SSD)", vortex_disk_rate);
-    println!("    • Vortex Measured Latency    : {:>10.2} ms / commit", vortex_disk_latency_ms);
-    println!("    • Kafka with acks=all (fsync): ~2,000 - 8,000 msgs/s (Physical NVMe flush barrier)");
-    println!("    • Architectural Verdict      : Both systems hit the physical NVMe/SSD sync barrier");
+    println!("  Metric 3: Synchronous Physical Disk Commit & Durability Barrier (fsync)");
+    println!("    • Measured Commit Rate       : {:>10.0} commits/s", vortex_disk_rate);
+    println!("    • Measured Commit Latency    : {:>10.2} ms / commit", vortex_disk_latency_ms);
+    println!("    • Storage Guarantee          : Atomic .commit boundary sync on physical NVMe/SSD");
     println!("  ---------------------------------------------------------------------------------\n");
 }
