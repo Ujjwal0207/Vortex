@@ -6,6 +6,7 @@ from .protocol import (
     encode_frame, decode_frame, encode_produce_payload, decode_produce_response
 )
 from .crypto import compute_record_hash
+from .gen_ai import GenAiEvent
 
 class VortexClient:
     def __init__(self, host: str = "127.0.0.1", port: int = 9092, client_id: str = "vortex-py-v0.1.0", timeout: float = 5.0):
@@ -50,6 +51,10 @@ class VortexClient:
             raise ValueError(f"Correlation ID mismatch: expected {cid}, got {resp_frame.correlation_id}")
             
         return decode_produce_response(resp_frame.payload)
+
+    async def produce_agent_event(self, topic: str, event: GenAiEvent, key: bytes = b"", partition: int = 0) -> ProduceReceipt:
+        payload = event.to_bytes()
+        return await self.produce(topic=topic, value=payload, key=key, partition=partition)
 
     async def fetch(self, topic: str, partition: int = 0, start_offset: int = 0) -> List[Record]:
         return []
