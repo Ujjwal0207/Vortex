@@ -86,6 +86,13 @@ build/
 .ruff_cache/
 *.whl
 
+# Node.js & TypeScript dependencies
+node_modules/
+npm-debug.log*
+
+# Go test binaries
+*.test
+
 # IDE & Editor Scratch Files
 .agents/
 .vscode/
