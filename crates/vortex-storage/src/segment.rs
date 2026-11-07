@@ -9,7 +9,7 @@ use std::sync::Arc;
 use vortex_core::{
     error::Result,
     record::{Record, RECORD_HEADER_SIZE},
-    HashDigest, MerkleMountainRange, MmrInclusionProof, VortexError,
+    HashDigest, MerkleMountainRange, MmrInclusionProof, TopicMode, VortexError,
 };
 
 use crate::batch_io::{BatchedPositionalIo, BatchedWriteRequest};
@@ -76,6 +76,7 @@ pub struct Segment {
     pub genesis_hash: HashDigest,
     pub last_record_hash: HashDigest,
     pub leader_epoch: u32,
+    pub topic_mode: TopicMode,
     pub path: PathBuf,
     active_file: Option<Arc<File>>,
     pub fd_pool: Option<Arc<crate::fd_pool::FdPool>>,
@@ -163,15 +164,16 @@ impl Segment {
             self.next_offset,
             self.last_record_hash,
             self.leader_epoch,
+            self.topic_mode,
             mmr_guard.count(),
             &mmr_guard.peaks(),
         )?;
         Ok(())
     }
 
-    /// Opens an existing segment or creates a new `.vtx` segment at default epoch 0.
+    /// Opens an existing segment or creates a new `.vtx` segment at default epoch 0 with `TopicMode::Verifiable`.
     pub fn open_or_create(dir: &Path, base_offset: u64, genesis_hash: HashDigest) -> Result<Self> {
-        Self::open_or_create_with_epoch(dir, base_offset, genesis_hash, 0)
+        Self::open_or_create_with_epoch_and_mode(dir, base_offset, genesis_hash, 0, TopicMode::Verifiable)
     }
 
     /// Opens an existing segment or creates a new `.vtx` segment with an explicit leader epoch.
@@ -180,6 +182,33 @@ impl Segment {
         base_offset: u64,
         genesis_hash: HashDigest,
         leader_epoch: u32,
+    ) -> Result<Self> {
+        Self::open_or_create_with_epoch_and_mode(
+            dir,
+            base_offset,
+            genesis_hash,
+            leader_epoch,
+            TopicMode::Verifiable,
+        )
+    }
+
+    /// Opens an existing segment or creates a new `.vtx` segment with an explicit `TopicMode`.
+    pub fn open_or_create_with_mode(
+        dir: &Path,
+        base_offset: u64,
+        genesis_hash: HashDigest,
+        topic_mode: TopicMode,
+    ) -> Result<Self> {
+        Self::open_or_create_with_epoch_and_mode(dir, base_offset, genesis_hash, 0, topic_mode)
+    }
+
+    /// Opens an existing segment or creates a new `.vtx` segment with an explicit leader epoch and `TopicMode`.
+    pub fn open_or_create_with_epoch_and_mode(
+        dir: &Path,
+        base_offset: u64,
+        genesis_hash: HashDigest,
+        leader_epoch: u32,
+        topic_mode: TopicMode,
     ) -> Result<Self> {
         let filename = format!("{:020}.vtx", base_offset);
         let path = dir.join(filename);
@@ -205,6 +234,7 @@ impl Segment {
             header.put_slice(&genesis_hash);
             header.put_u64(0); // created_at placeholder
             header.put_u32(leader_epoch); // leader_epoch at offset 55
+            header.put_u8(topic_mode.to_u8()); // topic_mode at offset 59
 
             // Pad the header to the fixed 256-byte metadata block. The on-disk
             // index count lives in its final four bytes (offset 252).
@@ -225,6 +255,7 @@ impl Segment {
                 base_offset,
                 genesis_hash,
                 leader_epoch,
+                topic_mode,
                 0,
                 &[],
             )?;
@@ -235,6 +266,7 @@ impl Segment {
                 genesis_hash,
                 last_record_hash: genesis_hash,
                 leader_epoch,
+                topic_mode,
                 path,
                 active_file: Some(Arc::new(file)),
                 fd_pool: None,
@@ -275,6 +307,7 @@ impl Segment {
 
         let _created_at = reader.get_u64();
         let header_epoch = reader.get_u32();
+        let header_topic_mode = TopicMode::from_u8(header_buf[59]);
         // The fixed header index is intentionally treated as a cache. Rebuild it
         // from validated records so checkpoints beyond its 4,080-entry capacity
         // survive restart, and so a torn or stale index cannot direct reads wrongly.
@@ -298,6 +331,7 @@ impl Segment {
 
         let commit_path = commit_state_path(&path);
         let commit_state = read_commit_state(&commit_path)?;
+        let topic_mode = commit_state.as_ref().map_or(header_topic_mode, |s| s.topic_mode);
         let scan_end = match commit_state {
             Some(ref state) => {
                 if state.end_position < HEADER_INDEX_REGION_SIZE || state.end_position > file_len {
@@ -380,6 +414,7 @@ impl Segment {
                     genesis_hash,
                     last_record_hash: state.last_record_hash,
                     leader_epoch,
+                    topic_mode,
                     path,
                     commit_path,
                     active_file: Some(Arc::new(file)),
@@ -393,8 +428,6 @@ impl Segment {
                 });
             }
         }
-
-        
 
         let mut curr_pos = HEADER_INDEX_REGION_SIZE;
         let mut next_offset = base_offset;
@@ -451,8 +484,8 @@ impl Segment {
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
             let mut slice = &record_raw[..];
-            let rec = Record::decode(&mut slice)?;
-            if rec.offset != next_offset || rec.prev_hash != last_hash {
+            let rec = Record::decode_with_mode(&mut slice, topic_mode)?;
+            if rec.offset != next_offset || (topic_mode.is_verifiable() && rec.prev_hash != last_hash) {
                 return Err(VortexError::CryptographicLineageBroken {
                     offset: rec.offset,
                     expected: format!("{} at offset {}", hex_hash(&last_hash), next_offset),
@@ -460,7 +493,9 @@ impl Segment {
                 });
             }
 
-            mmr.append(rec.record_hash);
+            if topic_mode.is_verifiable() {
+                mmr.append(rec.record_hash);
+            }
 
             if index_entries.is_empty()
                 || curr_pos.saturating_sub(last_indexed_pos) >= SPARSE_INDEX_INTERVAL_BYTES
@@ -484,7 +519,17 @@ impl Segment {
 
         let leader_epoch = commit_state.as_ref().map_or(header_epoch, |s| s.leader_epoch);
         if commit_state.is_none() {
-            publish_commit_state(&path, &commit_path, curr_pos, next_offset, last_hash, leader_epoch, mmr.count(), &mmr.peaks())?;
+            publish_commit_state(
+                &path,
+                &commit_path,
+                curr_pos,
+                next_offset,
+                last_hash,
+                leader_epoch,
+                topic_mode,
+                mmr.count(),
+                &mmr.peaks(),
+            )?;
         }
 
         let bytes_since_last_index = curr_pos.saturating_sub(last_indexed_pos);
@@ -497,6 +542,7 @@ impl Segment {
             genesis_hash,
             last_record_hash: last_hash,
             leader_epoch,
+            topic_mode,
             path,
             active_file: Some(Arc::new(file)),
             fd_pool: None,
@@ -559,9 +605,20 @@ impl Segment {
         let mut new_index_entries = Vec::new();
 
         for (key, value, timestamp) in batch {
-            let record = match timestamp {
-                Some(ts) => Record::new_with_timestamp(curr_hash, curr_offset, key, value, ts),
-                None => Record::new(curr_hash, curr_offset, key, value),
+            let record = match self.topic_mode {
+                TopicMode::Raw => {
+                    let ts = timestamp.unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64
+                    });
+                    Record::new_raw(curr_offset, key, value, ts)
+                }
+                TopicMode::Verifiable => match timestamp {
+                    Some(ts) => Record::new_with_timestamp(curr_hash, curr_offset, key, value, ts),
+                    None => Record::new(curr_hash, curr_offset, key, value),
+                },
             };
             let encoded = record.encode();
             let encoded_len = encoded.len() as u64;
@@ -625,8 +682,10 @@ impl Segment {
         }
 
         let mut temp_mmr = self.mmr.read().unwrap().clone();
-        for rec in &staged_records {
-            temp_mmr.append(rec.record_hash);
+        if self.topic_mode.is_verifiable() {
+            for rec in &staged_records {
+                temp_mmr.append(rec.record_hash);
+            }
         }
         let new_peaks = temp_mmr.peaks();
         let new_leaf_count = temp_mmr.count();
@@ -638,6 +697,7 @@ impl Segment {
             curr_offset,
             curr_hash,
             self.leader_epoch,
+            self.topic_mode,
             new_leaf_count,
             &new_peaks,
         ) {
@@ -740,7 +800,7 @@ impl Segment {
                 .map_err(|e| VortexError::Io(e.to_string()))?;
 
             let mut slice = &raw_record[..];
-            let rec = Record::decode(&mut slice)?;
+            let rec = Record::decode_with_mode(&mut slice, self.topic_mode)?;
 
             if rec.offset >= start_offset {
                 bytes_read += full_record_len;
@@ -889,6 +949,61 @@ impl Segment {
         }
     }
 
+    /// Locates the exact physical file slice `(file_position, byte_length)` for records starting at `start_offset`
+    /// up to `max_bytes` without reading record payload bytes into userspace heap buffers.
+    /// This enables direct-kernel zero-copy `sendfile(2)` and `splice(2)` streaming from OS page cache directly to network socket.
+    pub fn locate_record_slice(
+        &self,
+        start_offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(u64, u64)>> {
+        if start_offset < self.base_offset || start_offset >= self.next_offset || max_bytes == 0 {
+            return Ok(None);
+        }
+
+        let start_pos = self.find_file_position(start_offset);
+        let file = self.get_file()?;
+        let mut curr_pos = start_pos;
+        let mut slice_start = None;
+        let mut slice_end = start_pos;
+        let mut bytes_accumulated: usize = 0;
+
+        while curr_pos < self.current_data_position && bytes_accumulated < max_bytes {
+            let mut header_buf = [0u8; 16]; // 4 bytes len + 4 bytes crc + 8 bytes offset
+            if file.read_exact_at(&mut header_buf, curr_pos).is_err() {
+                break;
+            }
+            let total_len = u32::from_be_bytes(header_buf[0..4].try_into().unwrap()) as usize;
+            if total_len < (RECORD_HEADER_SIZE - 4) {
+                break;
+            }
+            let full_record_len = 4 + total_len;
+            let rec_offset = u64::from_be_bytes(header_buf[8..16].try_into().unwrap());
+
+            if rec_offset >= start_offset {
+                if slice_start.is_none() {
+                    slice_start = Some(curr_pos);
+                }
+                bytes_accumulated += full_record_len;
+                slice_end = curr_pos + full_record_len as u64;
+            }
+
+            curr_pos += full_record_len as u64;
+        }
+
+        match slice_start {
+            Some(start) => {
+                let len = slice_end.saturating_sub(start);
+                if len > 0 {
+                    Ok(Some((start, len)))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Returns total file size in bytes.
     pub fn size(&self) -> u64 {
         self.current_data_position
@@ -901,10 +1016,11 @@ struct CommitState {
     next_offset: u64,
     last_record_hash: HashDigest,
     leader_epoch: u32,
+    topic_mode: TopicMode,
     mmr_state: Option<(u64, Vec<HashDigest>)>,
 }
 
-pub(crate) fn commit_state_path(segment_path: &Path) -> PathBuf {
+pub fn commit_state_path(segment_path: &Path) -> PathBuf {
     let name = segment_path.file_name().expect("segment path has a filename");
     let mut sidecar_name = name.to_os_string();
     sidecar_name.push(".commit");
@@ -931,6 +1047,7 @@ fn read_commit_state(path: &Path) -> Result<Option<CommitState>> {
         {
             return Err(VortexError::Io("invalid or corrupt segment commit marker".into()));
         }
+        let topic_mode = TopicMode::from_u8(bytes[5]);
         let peak_count = u16::from_be_bytes(bytes[6..8].try_into().unwrap()) as usize;
         let end_position = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
         let next_offset = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
@@ -951,6 +1068,7 @@ fn read_commit_state(path: &Path) -> Result<Option<CommitState>> {
             next_offset,
             last_record_hash,
             leader_epoch,
+            topic_mode,
             mmr_state: Some((mmr_leaf_count, mmr_peaks)),
         }))
     } else if length == COMMIT_STATE_SIZE as u64 {
@@ -975,6 +1093,7 @@ fn read_commit_state(path: &Path) -> Result<Option<CommitState>> {
             next_offset,
             last_record_hash,
             leader_epoch: 0,
+            topic_mode: TopicMode::Verifiable,
             mmr_state: None,
         }))
     } else {
@@ -989,12 +1108,14 @@ fn publish_commit_state(
     next_offset: u64,
     last_record_hash: HashDigest,
     leader_epoch: u32,
+    topic_mode: TopicMode,
     mmr_leaf_count: u64,
     mmr_peaks: &[HashDigest],
 ) -> Result<()> {
     let mut bytes = [0u8; COMMIT_STATE_V2_SIZE];
     bytes[0..4].copy_from_slice(&COMMIT_STATE_MAGIC_V2.to_be_bytes());
     bytes[4] = COMMIT_STATE_VERSION_2;
+    bytes[5] = topic_mode.to_u8();
     let peak_count = mmr_peaks.len().min(63) as u16;
     bytes[6..8].copy_from_slice(&peak_count.to_be_bytes());
     bytes[8..16].copy_from_slice(&end_position.to_be_bytes());
