@@ -11,6 +11,7 @@ pub mod tiered;
 pub mod verifier;
 pub mod watermark;
 pub mod witness;
+pub mod zero_copy;
 
 pub use batch_io::{BatchedPositionalIo, BatchedWriteRequest};
 pub use compaction::{
@@ -30,6 +31,7 @@ pub use watermark::{
     WATERMARK_INGRESS_SHED_PERCENT, WATERMARK_SOFT_WARN_PERCENT,
 };
 pub use witness::{IndependentWitness, WitnessState};
+pub use zero_copy::ZeroCopySplicer;
 
 
 
