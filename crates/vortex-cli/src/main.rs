@@ -4,9 +4,11 @@ use clap::{Parser, Subcommand};
 mod agent_demo;
 mod bench;
 mod client;
+mod verifier_cmd;
 
 use bench::run_benchmark;
 use client::VortexClient;
+use verifier_cmd::{execute_verify, VerifyOptions};
 
 #[derive(Parser, Debug)]
 #[command(name = "vortex-cli", version = "0.1.0", about = "Vortex Command Line Interface & Benchmarking Tool")]
@@ -129,6 +131,37 @@ enum Commands {
 
         #[arg(short = 'k', long)]
         pubkeys: Option<std::path::PathBuf>,
+    },
+
+    /// Standalone compliance verification of raw partition directories, segments, or evidence bundles
+    Verify {
+        /// Path to raw partition directory, .vtx segment file, or bundle
+        #[arg(short = 'd', long)]
+        path: std::path::PathBuf,
+
+        /// Optional topic name (defaults to directory name or "default-topic")
+        #[arg(short = 't', long)]
+        topic: Option<String>,
+
+        /// Partition ID (default: 0)
+        #[arg(short = 'p', long, default_value_t = 0)]
+        partition: u32,
+
+        /// Optional path to public key file for Notary Ed25519 signature verification
+        #[arg(short = 'k', long)]
+        pubkey: Option<std::path::PathBuf>,
+
+        /// Optional path to client receipts.jsonl file
+        #[arg(short = 'r', long)]
+        receipts: Option<std::path::PathBuf>,
+
+        /// Optional path to witness reel.wit
+        #[arg(short = 'w', long)]
+        witness: Option<std::path::PathBuf>,
+
+        /// Fail on any audit warning
+        #[arg(short = 's', long, default_value_t = false)]
+        strict: bool,
     },
 }
 
@@ -391,6 +424,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wit_pubkey,
             )?;
             report.print_summary();
+        }
+        Commands::Verify {
+            path,
+            topic,
+            partition,
+            pubkey,
+            receipts,
+            witness,
+            strict,
+        } => {
+            if let Err(exit_code) = execute_verify(VerifyOptions {
+                path,
+                topic,
+                partition,
+                pubkey,
+                receipts,
+                witness,
+                strict,
+            }) {
+                std::process::exit(exit_code);
+            }
         }
     }
 
