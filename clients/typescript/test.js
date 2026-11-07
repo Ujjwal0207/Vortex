@@ -58,5 +58,27 @@ assert.strictEqual(tamperResult.valid, false);
 assert.strictEqual(tamperResult.errorIndex, 4);
 console.log('✓ Bit-rot / tamper detection at index 4 passed');
 
+// Test 4: GenAiEvent Serialization
+const { GenAiEvent } = require('./index');
+const agentEvent = new GenAiEvent({
+  traceId: 'trace-node-123',
+  spanId: 'span-node-456',
+  system: 'openai',
+  model: 'gpt-4o',
+  prompt: 'Execute automated deployment',
+  toolName: 'k8s_apply',
+  toolParameters: { replicas: 3 },
+  supervisorId: 'devops-lead@enterprise.com',
+});
+const serialized = agentEvent.toBytes();
+const deserialized = GenAiEvent.fromBytes(serialized);
+assert.strictEqual(deserialized.trace_id, 'trace-node-123');
+assert.strictEqual(deserialized.system, 'openai');
+assert.strictEqual(deserialized.model, 'gpt-4o');
+assert.strictEqual(deserialized.prompt, 'Execute automated deployment');
+assert.deepStrictEqual(deserialized.tool_parameters, { replicas: 3 });
+assert.strictEqual(deserialized.supervisor_id, 'devops-lead@enterprise.com');
+console.log('✓ GenAiEvent serialization roundtrip passed');
+
 console.log('All TypeScript / Node.js SDK tests passed successfully!');
 
