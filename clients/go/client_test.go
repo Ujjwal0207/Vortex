@@ -181,3 +181,45 @@ func TestConcurrentClientPooling(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestGenAiEventProducing(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	client, err := NewClient(Config{
+		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			go func(c net.Conn) {
+				req, err := DecodeFrame(c)
+				if err != nil {
+					return
+				}
+				respBuf := new(bytes.Buffer)
+				respBuf.Write([]byte{0x00, 0x04, 't', 'e', 's', 't'}) // topic
+				respBuf.Write(make([]byte, 2+4+8+8+2+32))              // partition details
+				respFrame := &Frame{
+					ApiKey:        ApiKeyProduce,
+					ApiVersion:    1,
+					CorrelationID: req.CorrelationID,
+					Payload:       respBuf.Bytes(),
+				}
+				encoded, _ := EncodeFrame(respFrame)
+				c.Write(encoded)
+			}(serverConn)
+			return clientConn, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	event := NewGenAiEvent("trace-123", "span-456", "anthropic", "claude-3-7-sonnet")
+	event.Prompt = "Verify flight recorder"
+	event.SupervisorID = "sec-ops@vortex.io"
+
+	resp, err := client.ProduceAgentEvent(context.Background(), "agent-audit", 0, []byte("agent-1"), event)
+	if err != nil {
+		t.Fatalf("ProduceAgentEvent failed: %v", err)
+	}
+	if resp.Topic != "test" {
+		t.Errorf("expected topic 'test', got '%s'", resp.Topic)
+	}
+}
