@@ -5,6 +5,7 @@ pub mod gateway;
 pub mod keyring;
 pub mod linger;
 pub mod partition;
+pub mod pcqr;
 pub mod scrubber;
 pub mod segment;
 pub mod tiered;
@@ -12,8 +13,9 @@ pub mod verifier;
 pub mod watermark;
 pub mod witness;
 pub mod zero_copy;
+pub mod zk_audit;
 
-pub use batch_io::{BatchedPositionalIo, BatchedWriteRequest};
+pub use batch_io::{BatchedPositionalIo, BatchedWriteRequest, SqpollConfig, SqpollStats, SqpollSubmissionRing};
 pub use compaction::{
     compute_state_merkle_root, deduplicate_records, ChangelogCompactor, CompactionAnchor,
 };
@@ -22,6 +24,10 @@ pub use gateway::{ActionGateway, AgentBudgetConfig, AgentBudgetGovernor, PolicyE
 pub use keyring::TwoSlotKeyring;
 pub use linger::AdaptiveLingerQueue;
 pub use partition::{AppendResult, PartitionLog, PartitionVerifyReport, DEFAULT_MAX_SEGMENT_BYTES};
+pub use pcqr::{
+    MMRCommitPulse, PcqrElectionValidator, PcqrFollowerNode, PcqrLeaderReplicator,
+    QuorumCommitTracker, ReplicaState, ReplicaStatus, ReplicationAck, ZeroDivergenceValidator,
+};
 pub use scrubber::{ScrubReport, Scrubber};
 pub use segment::{IndexEntry, Segment, HEADER_INDEX_REGION_SIZE, SEGMENT_MAGIC};
 pub use tiered::{ExtractedSegmentArchive, SegmentArchiveManifest, TieredArchiveManager};
@@ -32,6 +38,7 @@ pub use watermark::{
 };
 pub use witness::{IndependentWitness, WitnessState};
 pub use zero_copy::ZeroCopySplicer;
+pub use zk_audit::ZkAuditEngine;
 
 
 
