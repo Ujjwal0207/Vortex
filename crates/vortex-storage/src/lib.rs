@@ -19,8 +19,8 @@ pub mod zk_audit;
 
 pub use arrow_parquet::{
     export_partition_arrow_ipc, export_partition_parquet, project_partition_to_arrow,
-    ArrowColumnarBatch, ArrowExportStats, ParquetExportStats, COL_MMR_ROOT, COL_OFFSET,
-    COL_PAYLOAD, COL_RECORD_HASH, COL_TIMESTAMP, PARQUET_MAGIC,
+    ArrowColumnarBatch, ArrowExportStats, ParquetExportStats, ARROW_CONTINUATION_TOKEN,
+    COL_MMR_ROOT, COL_OFFSET, COL_PAYLOAD, COL_RECORD_HASH, COL_TIMESTAMP, PARQUET_MAGIC,
 };
 pub use batch_io::{BatchedPositionalIo, BatchedWriteRequest, SqpollConfig, SqpollStats, SqpollSubmissionRing};
 pub use compaction::{
