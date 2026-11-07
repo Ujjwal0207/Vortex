@@ -741,6 +741,21 @@ impl PartitionLog {
         self.segments.last().and_then(|s| s.generate_consistency_proof(old_size))
     }
 
+    /// Returns the active segment's latest MMR root (alias for active_mmr_root).
+    pub fn latest_mmr_root(&self) -> HashDigest {
+        self.active_mmr_root()
+    }
+
+    /// Exports all committed records from this partition into an Apache Arrow IPC stream.
+    pub fn export_arrow_ipc(&self, writer: &mut impl std::io::Write) -> std::io::Result<crate::arrow_parquet::ArrowExportStats> {
+        crate::arrow_parquet::export_partition_arrow_ipc(self, writer)
+    }
+
+    /// Exports all committed records from this partition into an Apache Parquet columnar file.
+    pub fn export_parquet(&self, writer: &mut impl std::io::Write) -> std::io::Result<crate::arrow_parquet::ParquetExportStats> {
+        crate::arrow_parquet::export_partition_parquet(self, writer)
+    }
+
     /// Returns the historical MMR root for a pruned segment covering `offset`, if archived in the anchor ledger.
     pub fn get_pruned_anchor_root(&self, offset: u64) -> Option<vortex_core::HashDigest> {
         let anchor_path = self.dir.join("pruned_peaks.anchor");
