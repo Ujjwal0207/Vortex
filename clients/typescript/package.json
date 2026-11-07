@@ -1,0 +1,14 @@
+{
+  "name": "@vortex/client",
+  "version": "0.1.0",
+  "description": "Vortex native client library and cryptographic flight-recorder SDK for Node.js and TypeScript",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": ["vortex", "streaming", "cryptography", "flight-recorder", "blake3", "kafka"],
+  "author": "Vortex Contributors",
+  "license": "Apache-2.0"
+}
+
