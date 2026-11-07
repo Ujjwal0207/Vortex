@@ -9,6 +9,38 @@ use crate::hash::{compute_record_hash, verify_record_integrity, HashDigest};
 /// total_len (4) + crc32 (4) + offset (8) + timestamp (8) + prev_hash (32) + record_hash (32) + key_len (4) + val_len (4) = 96 bytes.
 pub const RECORD_HEADER_SIZE: usize = 96;
 
+/// The assurance mode for a topic:
+/// - `Verifiable` (default): full Blake3 SIMD hash chaining, forward-secure ratchets, and MMR inclusion commitments.
+/// - `Raw`: zero-crypto hardware CRC32 line-rate streaming; skips Blake3 chaining, ratchet step evolution, and MMR recalculations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[repr(u8)]
+pub enum TopicMode {
+    #[default]
+    Verifiable = 0,
+    Raw = 1,
+}
+
+impl TopicMode {
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            1 => TopicMode::Raw,
+            _ => TopicMode::Verifiable,
+        }
+    }
+
+    pub fn to_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn is_raw(self) -> bool {
+        matches!(self, TopicMode::Raw)
+    }
+
+    pub fn is_verifiable(self) -> bool {
+        matches!(self, TopicMode::Verifiable)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub offset: u64,
@@ -20,6 +52,30 @@ pub struct Record {
 }
 
 impl Record {
+    /// Creates a record in Raw streaming mode (zero Blake3 crypto overhead).
+    pub fn new_raw(offset: u64, key: Option<Bytes>, value: Bytes, timestamp: u64) -> Self {
+        let mut crc_hasher = Crc32Hasher::new();
+        crc_hasher.update(&offset.to_be_bytes());
+        crc_hasher.update(&timestamp.to_be_bytes());
+        if let Some(ref k) = key {
+            crc_hasher.update(k);
+        }
+        crc_hasher.update(&value);
+        let crc = crc_hasher.finalize();
+
+        let mut record_hash = [0u8; 32];
+        record_hash[0..4].copy_from_slice(&crc.to_be_bytes());
+
+        Self {
+            offset,
+            timestamp,
+            prev_hash: [0u8; 32],
+            record_hash,
+            key,
+            value,
+        }
+    }
+
     /// Creates a new Record with automatic timestamping and cryptographic Blake3 hash calculation.
     pub fn new(prev_hash: HashDigest, offset: u64, key: Option<Bytes>, value: Bytes) -> Self {
         let timestamp = SystemTime::now()
@@ -115,6 +171,18 @@ impl Record {
 
     /// Decodes a binary record from a byte buffer and verifies both CRC32 and cryptographic integrity.
     pub fn decode(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_with_mode(buf, TopicMode::Verifiable)
+    }
+
+    /// Decodes a binary record from a byte buffer using raw mode (CRC32 checked, Blake3 cryptographic integrity check bypassed).
+    pub fn decode_raw(buf: &mut impl Buf) -> Result<Self> {
+        Self::decode_with_mode(buf, TopicMode::Raw)
+    }
+
+    /// Decodes a binary record with the specified `TopicMode`.
+    /// When `mode` is `TopicMode::Verifiable`, full Blake3 cryptographic lineage is verified.
+    /// When `mode` is `TopicMode::Raw`, hardware CRC32 checksum is verified and Blake3 checking is skipped for maximum line-rate throughput.
+    pub fn decode_with_mode(buf: &mut impl Buf, mode: TopicMode) -> Result<Self> {
         if buf.remaining() < 8 {
             return Err(VortexError::BufferUnderflow {
                 needed: 8,
@@ -191,15 +259,17 @@ impl Record {
         }
         let value = reader.copy_to_bytes(val_len);
 
-        // 3. Verify Blake3 cryptographic integrity
-        if !verify_record_integrity(
-            &prev_hash,
-            &record_hash,
-            offset,
-            timestamp,
-            key.as_deref(),
-            &value,
-        ) {
+        // 3. Verify Blake3 cryptographic integrity if in Verifiable mode
+        if mode.is_verifiable()
+            && !verify_record_integrity(
+                &prev_hash,
+                &record_hash,
+                offset,
+                timestamp,
+                key.as_deref(),
+                &value,
+            )
+        {
             return Err(VortexError::CryptographicLineageBroken {
                 offset,
                 expected: hex::encode(record_hash),
