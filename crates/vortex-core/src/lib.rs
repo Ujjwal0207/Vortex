@@ -9,6 +9,7 @@ pub mod record;
 pub mod shred;
 pub mod spsc;
 pub mod tx;
+pub mod zkp;
 
 pub use blind_index::BlindIndexer;
 pub use error::{Result, VortexError};
@@ -25,4 +26,8 @@ pub use record::{Record, TopicMode, RECORD_HEADER_SIZE};
 pub use shred::EntityKeyRegistry;
 pub use spsc::SpscRingBuffer;
 pub use tx::{IsolationLevel, TransactionCoordinator, CONTROL_TXN_ABORT, CONTROL_TXN_COMMIT};
+pub use zkp::{
+    ZkBatchAuditProof, ZkBatchProver, ZkBatchPublicInputs, ZkBatchVerifier,
+    ZK_SNARK_PROOF_BYTES_LEN,
+};
 
