@@ -21,7 +21,7 @@ pub use hash::{compute_genesis_hash, compute_record_hash, verify_record_integrit
 pub use mmr::{MerkleMountainRange, MmrConsistencyProof, MmrInclusionProof, PeakConsistencyProof};
 pub use ore::{OreRangeQuery, OreTag, OrderRevealingIndexer};
 pub use ratchet::{constant_time_eq_32, ForwardSecureRatchet, KeyringSlot, KEYRING_SLOT_SIZE};
-pub use record::{Record, RECORD_HEADER_SIZE};
+pub use record::{Record, TopicMode, RECORD_HEADER_SIZE};
 pub use shred::EntityKeyRegistry;
 pub use spsc::SpscRingBuffer;
 pub use tx::{IsolationLevel, TransactionCoordinator, CONTROL_TXN_ABORT, CONTROL_TXN_COMMIT};
