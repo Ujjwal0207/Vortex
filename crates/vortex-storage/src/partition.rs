@@ -9,7 +9,7 @@ use std::os::windows::fs::FileExt;
 
 use vortex_core::{
     compute_genesis_hash, error::Result, record::Record, ForwardSecureRatchet, HashDigest,
-    MmrInclusionProof, VortexError,
+    MmrInclusionProof, TopicMode, VortexError,
 };
 
 use crate::keyring::{TwoSlotKeyring, PARTITION_MACS_FILE};
@@ -48,6 +48,7 @@ pub struct PartitionLog {
     pub keyring: TwoSlotKeyring,
     pub fd_pool: Arc<crate::fd_pool::FdPool>,
     pub leader_epoch: u32,
+    pub topic_mode: TopicMode,
 }
 
 impl PartitionLog {
@@ -58,7 +59,18 @@ impl PartitionLog {
         partition_id: u32,
         max_segment_bytes: u64,
     ) -> Result<Self> {
-        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, None, None)
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, None, None, None)
+    }
+
+    /// Opens an existing partition directory or initializes a new partition log with an explicit `TopicMode`.
+    pub fn open_or_create_with_mode(
+        base_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+        max_segment_bytes: u64,
+        topic_mode: TopicMode,
+    ) -> Result<Self> {
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, None, None, Some(topic_mode))
     }
 
     /// Opens an existing partition directory or initializes a new partition log with an explicit secret genesis seed.
@@ -70,7 +82,19 @@ impl PartitionLog {
         max_segment_bytes: u64,
         genesis_seed: [u8; 32],
     ) -> Result<Self> {
-        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, Some(genesis_seed), None)
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, Some(genesis_seed), None, None)
+    }
+
+    /// Opens an existing partition directory or initializes a new partition log with seed and explicit `TopicMode`.
+    pub fn open_or_create_with_seed_and_mode(
+        base_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+        max_segment_bytes: u64,
+        genesis_seed: [u8; 32],
+        topic_mode: TopicMode,
+    ) -> Result<Self> {
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, Some(genesis_seed), None, Some(topic_mode))
     }
 
     /// Opens an existing partition directory or initializes a new partition log with a shared FdPool.
@@ -81,7 +105,7 @@ impl PartitionLog {
         max_segment_bytes: u64,
         fd_pool: Arc<crate::fd_pool::FdPool>,
     ) -> Result<Self> {
-        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, None, Some(fd_pool))
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, None, Some(fd_pool), None)
     }
 
     /// Opens an existing partition directory or initializes a new partition log with seed and shared FdPool.
@@ -93,7 +117,20 @@ impl PartitionLog {
         genesis_seed: [u8; 32],
         fd_pool: Arc<crate::fd_pool::FdPool>,
     ) -> Result<Self> {
-        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, Some(genesis_seed), Some(fd_pool))
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, Some(genesis_seed), Some(fd_pool), None)
+    }
+
+    /// Opens an existing partition directory or initializes a new partition log with full configuration.
+    pub fn open_or_create_with_seed_pool_and_mode(
+        base_dir: &Path,
+        topic: &str,
+        partition_id: u32,
+        max_segment_bytes: u64,
+        genesis_seed: Option<[u8; 32]>,
+        fd_pool: Option<Arc<crate::fd_pool::FdPool>>,
+        topic_mode: Option<TopicMode>,
+    ) -> Result<Self> {
+        Self::open_or_create_internal(base_dir, topic, partition_id, max_segment_bytes, genesis_seed, fd_pool, topic_mode)
     }
 
     fn open_or_create_internal(
@@ -103,6 +140,7 @@ impl PartitionLog {
         max_segment_bytes: u64,
         genesis_seed: Option<[u8; 32]>,
         fd_pool: Option<Arc<crate::fd_pool::FdPool>>,
+        explicit_mode: Option<TopicMode>,
     ) -> Result<Self> {
         let fd_pool = fd_pool.unwrap_or_else(|| Arc::new(crate::fd_pool::FdPool::new(512)));
         let dir = base_dir.join(topic).join(format!("partition-{}", partition_id));
@@ -120,11 +158,12 @@ impl PartitionLog {
         segment_files.sort();
 
         let mut segments = Vec::new();
+        let target_mode = explicit_mode.unwrap_or(TopicMode::Verifiable);
 
         if segment_files.is_empty() {
-            // New partition: initialize with deterministic genesis root
+            // New partition: initialize with deterministic genesis root and target mode
             let genesis = compute_genesis_hash(topic, partition_id);
-            let mut active = Segment::open_or_create(&dir, 0, genesis)?;
+            let mut active = Segment::open_or_create_with_mode(&dir, 0, genesis, target_mode)?;
             active.set_fd_pool(fd_pool.clone());
             segments.push(active);
         } else {
@@ -239,6 +278,10 @@ impl PartitionLog {
             )?,
         };
 
+        let effective_mode = explicit_mode.unwrap_or_else(|| {
+            segments.first().map_or(target_mode, |s| s.topic_mode)
+        });
+
         Ok(Self {
             topic: topic.to_string(),
             partition_id,
@@ -248,6 +291,7 @@ impl PartitionLog {
             keyring,
             fd_pool,
             leader_epoch,
+            topic_mode: effective_mode,
         })
     }
 
@@ -301,8 +345,13 @@ impl PartitionLog {
 
         let mut results = Vec::with_capacity(appended.len());
         for rec in appended {
-            let encoded = rec.encode();
-            let writer_mac = self.keyring.step_and_authenticate(&encoded, rec.offset + 1)?;
+            let writer_mac = if self.topic_mode.is_raw() {
+                // In Raw mode: ratchet authentication step is completely bypassed
+                [0u8; 32]
+            } else {
+                let encoded = rec.encode();
+                self.keyring.step_and_authenticate(&encoded, rec.offset + 1)?
+            };
             results.push(AppendResult {
                 record: rec,
                 writer_mac,
@@ -340,7 +389,7 @@ impl PartitionLog {
     }
 
     /// Explicitly rolls the active segment, creating a new segment that inherits
-    /// the cryptographic tail hash of the current active segment and current leader epoch.
+    /// the cryptographic tail hash of the current active segment, current leader epoch, and topic mode.
     /// The rolled predecessor is sealed immediately to release its open file descriptor.
     pub fn roll_segment(&mut self) -> Result<()> {
         let active = self.active_segment_mut();
@@ -350,11 +399,12 @@ impl PartitionLog {
         let next_base_offset = active.next_offset;
         let predecessor_tail_hash = active.last_record_hash;
 
-        let mut new_segment = Segment::open_or_create_with_epoch(
+        let mut new_segment = Segment::open_or_create_with_epoch_and_mode(
             &self.dir,
             next_base_offset,
             predecessor_tail_hash,
             self.leader_epoch,
+            self.topic_mode,
         )?;
         new_segment.set_fd_pool(self.fd_pool.clone());
         self.segments.push(new_segment);
@@ -556,6 +606,69 @@ impl PartitionLog {
         }
 
         Ok(results)
+    }
+
+    /// Locates the file handle and physical byte boundaries `(file, file_position, byte_length)`
+    /// for records starting at `start_offset` up to `max_bytes` without reading payloads into memory.
+    /// This enables direct-kernel zero-copy `sendfile(2)` and `splice(2)` streaming from OS page cache directly to network socket.
+    pub fn locate_record_slice(
+        &self,
+        start_offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(Arc<std::fs::File>, u64, u64)>> {
+        if self.segments.is_empty() || max_bytes == 0 {
+            return Ok(None);
+        }
+
+        let first_offset = self.segments[0].base_offset;
+        let next_offset = self.next_offset();
+
+        if start_offset < first_offset || start_offset >= next_offset {
+            return Ok(None);
+        }
+
+        let seg_idx = match self
+            .segments
+            .binary_search_by_key(&start_offset, |s| s.base_offset)
+        {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+
+        let seg = &self.segments[seg_idx];
+        if let Some((pos, len)) = seg.locate_record_slice(start_offset, max_bytes)? {
+            let file = seg.get_file()?;
+            Ok(Some((file, pos, len)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Directly splices records starting at `start_offset` up to `max_bytes` to `out_fd`
+    /// via direct kernel page-cache `sendfile(2)`, bypassing userspace heap memory buffers.
+    #[cfg(unix)]
+    pub fn splice_records_to_fd(
+        &self,
+        start_offset: u64,
+        max_bytes: usize,
+        out_fd: std::os::unix::io::RawFd,
+    ) -> Result<u64> {
+        if let Some((file, pos, len)) = self.locate_record_slice(start_offset, max_bytes)? {
+            crate::zero_copy::ZeroCopySplicer::splice_file_to_fd(&file, out_fd, pos, len)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Directly splices records on non-unix platforms (fallback).
+    #[cfg(not(unix))]
+    pub fn splice_records_to_fd(
+        &self,
+        _start_offset: u64,
+        _max_bytes: usize,
+        _out_fd: i32,
+    ) -> Result<u64> {
+        Err(VortexError::Io("zero-copy splicing is only supported on Unix targets".into()))
     }
 
     /// Generates an O(log N) cryptographic MMR inclusion proof for the record at `offset`.
@@ -850,6 +963,22 @@ impl PartitionLog {
         }
 
         let latest_offset = expected_base_offset.unwrap_or(0);
+
+        let is_raw = all_segments.first().map_or(false, |s| s.topic_mode.is_raw());
+        if is_raw {
+            return Ok(PartitionVerifyReport {
+                topic: topic.to_string(),
+                partition_id,
+                total_segments: all_segments.len(),
+                total_records,
+                earliest_offset,
+                latest_offset,
+                final_mmr_root,
+                final_record_hash,
+                is_valid: true,
+                macs_verified: false,
+            });
+        }
 
         // Verification of partition.macs sidecar log
         let mut macs_verified = false;
