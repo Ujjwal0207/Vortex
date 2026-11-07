@@ -54,6 +54,28 @@ class TestVortexPythonSDK(unittest.TestCase):
         payload = encode_produce_payload("test_topic", 0, [rec])
         self.assertGreater(len(payload), 0)
 
+    def test_gen_ai_event_serialization(self):
+        from vortex import GenAiEvent
+        event = GenAiEvent(
+            trace_id="trace-abc",
+            span_id="span-xyz",
+            system="anthropic",
+            model="claude-3-7-sonnet",
+            prompt="Analyze smart contract vulnerabilities",
+            tool_name="ast_parser",
+            tool_parameters={"depth": 3},
+            supervisor_id="auditor@sec.gov",
+        )
+        raw = event.to_bytes()
+        decoded = GenAiEvent.from_bytes(raw)
+        self.assertEqual(decoded.trace_id, "trace-abc")
+        self.assertEqual(decoded.system, "anthropic")
+        self.assertEqual(decoded.model, "claude-3-7-sonnet")
+        self.assertEqual(decoded.prompt, "Analyze smart contract vulnerabilities")
+        self.assertEqual(decoded.tool_parameters, {"depth": 3})
+        self.assertEqual(decoded.supervisor_id, "auditor@sec.gov")
+        self.assertIsNotNone(decoded.timestamp_ns)
+
 if __name__ == '__main__':
     unittest.main()
 
