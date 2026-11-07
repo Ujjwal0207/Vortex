@@ -5,7 +5,7 @@ use bytes::Bytes;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use vortex_core::error::Result;
+use vortex_core::{error::Result, TopicMode};
 use vortex_guard::{IngressValidator, QuarantinedEvent, ValidationConfig, ValidationOutcome};
 use vortex_protocol::{
     CreateTopicRequest, CreateTopicResponse, ErrorResponse, FetchRequest, FetchResponse, Frame,
@@ -192,6 +192,36 @@ impl Engine {
         Ok(FetchResponse { records })
     }
 
+    /// Locates the file handle and physical byte boundaries `(file, file_position, byte_length)`
+    /// for historical records starting at `start_offset` up to `max_bytes` without reading payloads into memory.
+    pub async fn locate_record_slice(
+        &self,
+        topic: &str,
+        partition_id: u32,
+        start_offset: u64,
+        max_bytes: usize,
+    ) -> Result<Option<(Arc<std::fs::File>, u64, u64)>> {
+        let partition = self.get_or_create_partition(topic, partition_id).await?;
+        let log = partition.log.read().await;
+        log.locate_record_slice(start_offset, max_bytes)
+    }
+
+    /// Directly splices records starting at `start_offset` up to `max_bytes` to `out_fd`
+    /// via direct kernel page-cache `sendfile(2)`, bypassing userspace heap memory buffers.
+    #[cfg(unix)]
+    pub async fn splice_records_to_fd(
+        &self,
+        topic: &str,
+        partition_id: u32,
+        start_offset: u64,
+        max_bytes: usize,
+        out_fd: std::os::unix::io::RawFd,
+    ) -> Result<u64> {
+        let partition = self.get_or_create_partition(topic, partition_id).await?;
+        let log = partition.log.read().await;
+        log.splice_records_to_fd(start_offset, max_bytes, out_fd)
+    }
+
     /// Returns retained and next offsets without reading record payloads.
     pub async fn partition_bounds(&self, topic: &str, partition_id: u32) -> Result<(u64, u64)> {
         let partition = self.get_or_create_partition(topic, partition_id).await?;
@@ -214,11 +244,33 @@ impl Engine {
     }
 
     pub async fn create_topic(&self, topic: &str, partitions: u32) -> Result<CreateTopicResponse> {
+        let default_mode = if topic.ends_with(".raw") || topic.contains(".raw.") {
+            TopicMode::Raw
+        } else {
+            TopicMode::Verifiable
+        };
+        self.create_topic_with_mode(topic, partitions, default_mode).await
+    }
+
+    /// Creates a topic with an explicit `TopicMode` (`Verifiable` or `Raw`).
+    pub async fn create_topic_with_mode(
+        &self,
+        topic: &str,
+        partitions: u32,
+        mode: TopicMode,
+    ) -> Result<CreateTopicResponse> {
         for p in 0..partitions {
-            self.get_or_create_partition(topic, p).await?;
+            self.get_or_create_partition_with_mode(topic, p, Some(mode)).await?;
         }
-        info!("Created topic '{}' with {} partitions", topic, partitions);
+        info!("Created topic '{}' with {} partitions in {:?} mode", topic, partitions, mode);
         Ok(CreateTopicResponse { success: true })
+    }
+
+    /// Returns the active `TopicMode` of the specified topic partition.
+    pub async fn topic_mode(&self, topic: &str, partition_id: u32) -> Result<TopicMode> {
+        let part = self.get_or_create_partition(topic, partition_id).await?;
+        let log = part.log.read().await;
+        Ok(log.topic_mode)
     }
 
     async fn route_to_quarantine(&self, event: QuarantinedEvent) -> Result<()> {
@@ -228,10 +280,19 @@ impl Engine {
         Ok(())
     }
 
-    async fn get_or_create_partition(
+    pub async fn get_or_create_partition(
         &self,
         topic: &str,
         partition_id: u32,
+    ) -> Result<PartitionHandle> {
+        self.get_or_create_partition_with_mode(topic, partition_id, None).await
+    }
+
+    pub async fn get_or_create_partition_with_mode(
+        &self,
+        topic: &str,
+        partition_id: u32,
+        mode: Option<TopicMode>,
     ) -> Result<PartitionHandle> {
         let key = (topic.to_string(), partition_id);
 
@@ -249,12 +310,22 @@ impl Engine {
             return Ok(part.clone());
         }
 
-        let log = PartitionLog::open_or_create_with_pool(
+        let target_mode = mode.unwrap_or_else(|| {
+            if topic.ends_with(".raw") || topic.contains(".raw.") {
+                TopicMode::Raw
+            } else {
+                TopicMode::Verifiable
+            }
+        });
+
+        let log = PartitionLog::open_or_create_with_seed_pool_and_mode(
             &self.data_dir,
             topic,
             partition_id,
             DEFAULT_MAX_SEGMENT_BYTES,
-            self.fd_pool.clone(),
+            None,
+            Some(self.fd_pool.clone()),
+            Some(target_mode),
         )?;
 
         let shared = Arc::new(RwLock::new(log));
