@@ -87,6 +87,7 @@ build/
 *.whl
 
 # IDE & Editor Scratch Files
+.agents/
 .vscode/
 .idea/
 .cursor/
