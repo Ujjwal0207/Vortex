@@ -25,7 +25,12 @@ impl KafkaBridge {
         (12, 0, 3),  // Heartbeat
         (13, 0, 2),  // LeaveGroup
         (14, 0, 3),  // SyncGroup
-        (18, 1, 1),  // ApiVersions
+        (15, 0, 5),  // DescribeGroups
+        (18, 0, 3),  // ApiVersions
+        (19, 0, 4),  // CreateTopics
+        (20, 0, 3),  // DeleteTopics
+        (22, 0, 5),  // InitProducerId
+        (32, 0, 4),  // DescribeConfigs
     ];
 
     pub async fn handle_frame(
@@ -49,8 +54,12 @@ impl KafkaBridge {
             KafkaApiKey::Heartbeat => 12,
             KafkaApiKey::LeaveGroup => 13,
             KafkaApiKey::SyncGroup => 14,
+            KafkaApiKey::DescribeGroups => 15,
             KafkaApiKey::ApiVersions => 18,
+            KafkaApiKey::CreateTopics => 19,
+            KafkaApiKey::DeleteTopics => 20,
             KafkaApiKey::InitProducerId => 22,
+            KafkaApiKey::DescribeConfigs => 32,
             KafkaApiKey::Unknown(k) => k,
         };
 
@@ -78,11 +87,15 @@ impl KafkaBridge {
             KafkaApiKey::FindCoordinator => Self::handle_find_coordinator(&mut payload, api_version),
             KafkaApiKey::JoinGroup => Self::handle_join_group(&mut payload, &coordinator, api_version),
             KafkaApiKey::SyncGroup => Self::handle_sync_group(&mut payload, &coordinator, api_version),
+            KafkaApiKey::DescribeGroups => Self::handle_describe_groups(&mut payload, &coordinator, api_version),
             KafkaApiKey::Heartbeat => Self::handle_heartbeat(&mut payload, &coordinator, api_version),
             KafkaApiKey::LeaveGroup => Self::handle_leave_group(&mut payload, &coordinator, api_version),
             KafkaApiKey::OffsetCommit => Self::handle_offset_commit(&mut payload, &coordinator, api_version),
             KafkaApiKey::OffsetFetch => Self::handle_offset_fetch(&mut payload, &coordinator, api_version),
+            KafkaApiKey::CreateTopics => Self::handle_create_topics(&mut payload, api_version),
+            KafkaApiKey::DeleteTopics => Self::handle_delete_topics(&mut payload, api_version),
             KafkaApiKey::InitProducerId => Self::handle_init_producer_id(api_version),
+            KafkaApiKey::DescribeConfigs => Self::handle_describe_configs(&mut payload, api_version),
             KafkaApiKey::Unknown(k) => {
                 warn!("Unsupported Kafka ApiKey {}; returning empty response", k);
                 Bytes::new()
@@ -809,6 +822,166 @@ impl KafkaBridge {
         buf.put_i16(-1); // ProducerEpoch
         if api_version >= 2 {
             buf.put_u8(0); // Empty flexible response TAG_BUFFER
+        }
+        buf.freeze()
+    }
+
+    fn handle_describe_groups(
+        payload: &mut Bytes,
+        _coordinator: &ConsumerGroupCoordinator,
+        version: i16,
+    ) -> Bytes {
+        let mut group_ids = Vec::new();
+        if payload.remaining() >= 4 {
+            let count = payload.get_i32();
+            for _ in 0..count {
+                if let Ok(gid) = KafkaCodec::get_string(payload) {
+                    group_ids.push(gid);
+                }
+            }
+        }
+
+        let mut buf = BytesMut::with_capacity(256);
+        if version >= 1 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
+
+        buf.put_i32(group_ids.len() as i32);
+        for gid in group_ids {
+            buf.put_i16(0); // ErrorCode: NONE
+            KafkaCodec::put_string(&mut buf, &gid);
+            KafkaCodec::put_string(&mut buf, "Stable"); // State
+            KafkaCodec::put_string(&mut buf, "consumer"); // ProtocolType
+            KafkaCodec::put_string(&mut buf, "range"); // ProtocolData
+            buf.put_i32(0); // Members: empty array
+        }
+        buf.freeze()
+    }
+
+    fn handle_create_topics(payload: &mut Bytes, version: i16) -> Bytes {
+        let mut created_topics = Vec::new();
+        if payload.remaining() >= 4 {
+            let count = payload.get_i32();
+            for _ in 0..count {
+                if let Ok(topic) = KafkaCodec::get_string(payload) {
+                    created_topics.push(topic);
+                }
+                // num_partitions (4B) + replication_factor (2B)
+                if payload.remaining() >= 6 {
+                    let _ = payload.get_i32();
+                    let _ = payload.get_i16();
+                }
+                // assignments array
+                if payload.remaining() >= 4 {
+                    let assign_count = payload.get_i32();
+                    for _ in 0..assign_count {
+                        if payload.remaining() >= 4 {
+                            let _ = payload.get_i32();
+                            if payload.remaining() >= 4 {
+                                let replica_count = payload.get_i32();
+                                for _ in 0..replica_count {
+                                    if payload.remaining() >= 4 {
+                                        let _ = payload.get_i32();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // configs array
+                if payload.remaining() >= 4 {
+                    let config_count = payload.get_i32();
+                    for _ in 0..config_count {
+                        let _ = KafkaCodec::get_string(payload);
+                        let _ = KafkaCodec::get_string(payload);
+                    }
+                }
+            }
+        }
+
+        let mut buf = BytesMut::with_capacity(128);
+        if version >= 2 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
+
+        buf.put_i32(created_topics.len() as i32);
+        for topic in created_topics {
+            KafkaCodec::put_string(&mut buf, &topic);
+            buf.put_i16(0); // ErrorCode: NONE
+            if version >= 1 {
+                KafkaCodec::put_string(&mut buf, ""); // ErrorMessage
+            }
+        }
+        buf.freeze()
+    }
+
+    fn handle_delete_topics(payload: &mut Bytes, version: i16) -> Bytes {
+        let mut deleted_topics = Vec::new();
+        if payload.remaining() >= 4 {
+            let count = payload.get_i32();
+            for _ in 0..count {
+                if let Ok(topic) = KafkaCodec::get_string(payload) {
+                    deleted_topics.push(topic);
+                }
+            }
+        }
+
+        let mut buf = BytesMut::with_capacity(128);
+        if version >= 1 {
+            buf.put_i32(0); // ThrottleTimeMs
+        }
+
+        buf.put_i32(deleted_topics.len() as i32);
+        for topic in deleted_topics {
+            KafkaCodec::put_string(&mut buf, &topic);
+            buf.put_i16(0); // ErrorCode: NONE
+        }
+        buf.freeze()
+    }
+
+    fn handle_describe_configs(payload: &mut Bytes, _version: i16) -> Bytes {
+        let mut resources = Vec::new();
+        if payload.remaining() >= 4 {
+            let count = payload.get_i32();
+            for _ in 0..count {
+                if payload.remaining() >= 1 {
+                    let resource_type = payload.get_i8();
+                    if let Ok(resource_name) = KafkaCodec::get_string(payload) {
+                        resources.push((resource_type, resource_name));
+                    }
+                    if payload.remaining() >= 4 {
+                        let key_count = payload.get_i32();
+                        for _ in 0..key_count {
+                            let _ = KafkaCodec::get_string(payload);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut buf = BytesMut::with_capacity(256);
+        buf.put_i32(0); // ThrottleTimeMs
+
+        buf.put_i32(resources.len() as i32);
+        for (res_type, res_name) in resources {
+            buf.put_i16(0); // ErrorCode: NONE
+            KafkaCodec::put_string(&mut buf, ""); // ErrorMessage
+            buf.put_i8(res_type);
+            KafkaCodec::put_string(&mut buf, &res_name);
+
+            // Default configs array (cleanup.policy = delete, retention.ms = 604800000)
+            buf.put_i32(2); // 2 configs
+            KafkaCodec::put_string(&mut buf, "cleanup.policy");
+            KafkaCodec::put_string(&mut buf, "delete");
+            buf.put_i8(1); // read_only: true
+            buf.put_i8(1); // is_default: true
+            buf.put_i8(0); // is_sensitive: false
+
+            KafkaCodec::put_string(&mut buf, "retention.ms");
+            KafkaCodec::put_string(&mut buf, "604800000");
+            buf.put_i8(1); // read_only: true
+            buf.put_i8(1); // is_default: true
+            buf.put_i8(0); // is_sensitive: false
         }
         buf.freeze()
     }
