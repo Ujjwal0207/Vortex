@@ -12,6 +12,7 @@ pub mod tiered;
 pub mod verifier;
 pub mod watermark;
 pub mod witness;
+pub mod witness_notary;
 pub mod zero_copy;
 pub mod zk_audit;
 
@@ -37,6 +38,7 @@ pub use watermark::{
     WATERMARK_INGRESS_SHED_PERCENT, WATERMARK_SOFT_WARN_PERCENT,
 };
 pub use witness::{IndependentWitness, WitnessState};
+pub use witness_notary::{WitnessNotaryEngine, WitnessNotaryPulse, WitnessNotaryRecord};
 pub use zero_copy::ZeroCopySplicer;
 pub use zk_audit::ZkAuditEngine;
 
