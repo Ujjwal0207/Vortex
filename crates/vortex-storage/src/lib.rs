@@ -1,3 +1,4 @@
+pub mod arrow_parquet;
 pub mod batch_io;
 pub mod compaction;
 pub mod fd_pool;
@@ -16,6 +17,11 @@ pub mod witness_notary;
 pub mod zero_copy;
 pub mod zk_audit;
 
+pub use arrow_parquet::{
+    export_partition_arrow_ipc, export_partition_parquet, project_partition_to_arrow,
+    ArrowColumnarBatch, ArrowExportStats, ParquetExportStats, COL_MMR_ROOT, COL_OFFSET,
+    COL_PAYLOAD, COL_RECORD_HASH, COL_TIMESTAMP, PARQUET_MAGIC,
+};
 pub use batch_io::{BatchedPositionalIo, BatchedWriteRequest, SqpollConfig, SqpollStats, SqpollSubmissionRing};
 pub use compaction::{
     compute_state_merkle_root, deduplicate_records, ChangelogCompactor, CompactionAnchor,
