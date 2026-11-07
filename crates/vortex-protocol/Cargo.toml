@@ -11,3 +11,6 @@ bytes.workspace = true
 crc32fast.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
