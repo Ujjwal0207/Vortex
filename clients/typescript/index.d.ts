@@ -24,6 +24,29 @@ export interface ProduceReceipt {
   recordHash: Buffer;
 }
 
+export interface GenAiEventInit {
+  traceId: string;
+  spanId: string;
+  system: string;
+  model: string;
+  prompt?: string;
+  completion?: string;
+  toolName?: string;
+  toolParameters?: Record<string, any>;
+  toolResult?: Record<string, any>;
+  modelWeightsHash?: string;
+  supervisorId?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  timestampNs?: string;
+}
+
+export class GenAiEvent {
+  constructor(init: GenAiEventInit);
+  toBytes(): Buffer;
+  static fromBytes(buf: Buffer): GenAiEvent;
+}
+
 export interface ClientOptions {
   host?: string;
   port?: number;
@@ -51,6 +74,7 @@ export class VortexClient {
   constructor(options?: ClientOptions);
   connect(): Promise<void>;
   produce(topic: string, value: Buffer | string, key?: Buffer | string, partition?: number): Promise<ProduceReceipt>;
+  produceAgentEvent(topic: string, event: GenAiEvent, key?: Buffer | string, partition?: number): Promise<ProduceReceipt>;
   close(): Promise<void>;
 }
 
