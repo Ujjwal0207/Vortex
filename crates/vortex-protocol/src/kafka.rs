@@ -15,8 +15,12 @@ pub enum KafkaApiKey {
     Heartbeat,
     LeaveGroup,
     SyncGroup,
+    DescribeGroups,
     ApiVersions,
+    CreateTopics,
+    DeleteTopics,
     InitProducerId,
+    DescribeConfigs,
     Unknown(i16),
 }
 
@@ -34,8 +38,12 @@ impl From<i16> for KafkaApiKey {
             12 => KafkaApiKey::Heartbeat,
             13 => KafkaApiKey::LeaveGroup,
             14 => KafkaApiKey::SyncGroup,
+            15 => KafkaApiKey::DescribeGroups,
             18 => KafkaApiKey::ApiVersions,
+            19 => KafkaApiKey::CreateTopics,
+            20 => KafkaApiKey::DeleteTopics,
             22 => KafkaApiKey::InitProducerId,
+            32 => KafkaApiKey::DescribeConfigs,
             other => KafkaApiKey::Unknown(other),
         }
     }
@@ -55,8 +63,12 @@ impl From<KafkaApiKey> for i16 {
             KafkaApiKey::Heartbeat => 12,
             KafkaApiKey::LeaveGroup => 13,
             KafkaApiKey::SyncGroup => 14,
+            KafkaApiKey::DescribeGroups => 15,
             KafkaApiKey::ApiVersions => 18,
+            KafkaApiKey::CreateTopics => 19,
+            KafkaApiKey::DeleteTopics => 20,
             KafkaApiKey::InitProducerId => 22,
+            KafkaApiKey::DescribeConfigs => 32,
             KafkaApiKey::Unknown(k) => k,
         }
     }
